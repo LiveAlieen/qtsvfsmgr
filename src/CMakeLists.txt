@@ -4,6 +4,8 @@ add_library(qtsvfs_core STATIC
     qtsvfs/format/Kdb.cpp
     qtsvfs/format/PathHash.cpp
     qtsvfs/format/QtsfNode.cpp
+    qtsvfs/codec/Codec.cpp
+    qtsvfs/Package.cpp
     qtsvfs/format/QtsfStream.cpp
 )
 target_include_directories(qtsvfs_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

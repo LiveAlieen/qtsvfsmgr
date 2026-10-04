@@ -124,7 +124,11 @@ std::uint64_t KdbFile::forEachRecord(const std::function<bool(const KdbRecord&)>
     std::unordered_set<std::uint32_t> visited;
     std::vector<std::uint8_t> page;
 
+    // 元数据卷的根在 @16，数据卷的根常在 @20（@16 可能是尚未使用的空页），两个都作为入口。
     stack.push_back(header_.rootPage);
+    if (header_.rootPageAlias != kKdbNull && header_.rootPageAlias != header_.rootPage) {
+        stack.push_back(header_.rootPageAlias);
+    }
     while (!stack.empty()) {
         const std::uint32_t off = stack.back();
         stack.pop_back();
@@ -161,6 +165,11 @@ std::uint64_t KdbFile::forEachRecord(const std::function<bool(const KdbRecord&)>
                 if (!visit(rec)) {
                     return seen;
                 }
+            }
+            // 叶子页的 next 是兄弟链（数据卷只有叶子时靠它铺满全表）。
+            const std::uint32_t next = le32(page.data() + kTrailer + 8);
+            if (next != kKdbNull) {
+                stack.push_back(next);
             }
         } else {
             // 内部节点：子页偏移数组，倒序入栈以得到按 key 升序的前向遍历。

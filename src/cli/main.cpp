@@ -16,6 +16,7 @@
 
 #include "qtsvfs/format/Kdb.h"
 #include "qtsvfs/format/QtsfNode.h"
+#include "qtsvfs/Package.h"
 #include "qtsvfs/format/PathHash.h"
 #include "qtsvfs/io/FileReader.h"
 #include "qtsvfs/probe/Probe.h"
@@ -251,6 +252,72 @@ int cmdNodes(const std::filesystem::path& p, std::uint64_t limit) {
     return 0;
 }
 
+static const char* kIndexLiterals[] = {"/(qts-exportsetting-node-index).data",
+                                                "/(qts-remaindir-node-index).data"};
+
+void printNode(const qtsvfs::QtsfNode& node, int depth, std::uint64_t& files,
+               std::uint64_t& dirs, std::uint64_t limit) {
+    for (int i = 0; i < depth; ++i) {
+        std::printf("  ");
+    }
+    std::printf("%s%s", node.name.empty() ? "/" : node.name.c_str(), node.dir ? "/" : "");
+    if (!node.dir) {
+        std::printf("  hash=%016llX", static_cast<unsigned long long>(node.hash));
+        ++files;
+    } else {
+        std::printf("  dir(%zu)", node.children.size());
+        ++dirs;
+    }
+    std::printf("\n");
+    if (node.dir && static_cast<std::uint64_t>(depth) < limit) {
+        for (const auto& c : node.children) {
+            printNode(c, depth + 1, files, dirs, limit);
+        }
+    }
+}
+
+int cmdTree(const std::filesystem::path& pkgDir, std::uint64_t depthLimit) {
+    qtsvfs::Package pkg;
+    std::string err;
+    if (!pkg.open(pkgDir, err)) {
+        std::fprintf(stderr, "打开包失败: %s\n", err.c_str());
+        return 2;
+    }
+    if (!pkg.loadNodes(err)) {
+        std::fprintf(stderr, "没有解析出 FileNode: %s\n", err.c_str());
+        return 2;
+    }
+    std::printf("包 %s：FileNode %zu 个，数据卷 %zu 个\n",
+                wideToUtf8(pkgDir.filename().native()).c_str(), pkg.nodes().size(),
+                pkg.volumeCount());
+    for (const char* lit : kIndexLiterals) {
+        const std::uint64_t hash = qtsvfs::calcHashCode64(lit);
+        const auto it = pkg.nodes().find(hash);
+        if (it == pkg.nodes().end()) {
+            std::printf("\n%s = %016llX：本包无此节点\n", lit, static_cast<unsigned long long>(hash));
+            continue;
+        }
+        std::vector<std::uint8_t> blob;
+        if (!pkg.readBlob(it->second, blob, err)) {
+            std::printf("\n%s：取块失败 %s\n", lit, err.c_str());
+            continue;
+        }
+        qtsvfs::QtsfNode root;
+        if (!qtsvfs::parseQtsfNode(blob.data(), blob.size(), root)) {
+            std::printf("\n%s：解出 %zu 字节，但节点流解析失败（首 16 字节 %s）\n", lit, blob.size(),
+                        bytesToHex(blob.data(), std::min<std::size_t>(16, blob.size())).c_str());
+            continue;
+        }
+        std::uint64_t files = 0, dirs = 0;
+        std::printf("\n%s：未压缩 %llu 字节，解出 %zu 字节\n", lit,
+                    static_cast<unsigned long long>(it->second.size), blob.size());
+        printNode(root, 0, files, dirs, depthLimit);
+        std::printf("  → 目录 %llu，文件 %llu\n", static_cast<unsigned long long>(dirs),
+                    static_cast<unsigned long long>(files));
+    }
+    return 0;
+}
+
 int cmdProbe(const std::filesystem::path& file, std::uint64_t head_bytes, std::uint64_t sample_bytes,
              std::uint64_t block_bytes) {
     qtsvfs::FileReader fr;
@@ -307,6 +374,7 @@ void usage() {
         "  qtsvfs hash <path>...                  计算节点哈希 (VFS_CalcHashCode64Raw)\n"
         "  qtsvfs kdb info <file.db>              外层 QtskDB 头\n"
         "  qtsvfs kdb records <file.db> [--max=N] [--hist]   枚举 B+树记录\n"
+        "  qtsvfs tree <packageDir> [--depth=N]      用官方 node-index 还原真实文件树\n"
         "  qtsvfs nodes <file.db> [--max=N]          解码 FileNode 与块表\n"
         "  qtsvfs probe <file> [--head=N] [--sample=N] [--block=N]\n"
         "\n"
@@ -400,6 +468,16 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "未知 kdb 子命令: %s\n", mode.c_str());
         return 1;
+    }
+    if (sub == "tree") {
+        const auto files = positional({});
+        if (files.empty()) {
+            std::fprintf(stderr, "tree 需要包目录参数，如 packages/0\n");
+            return 1;
+        }
+        std::uint64_t depth = 2;
+        optValue("--depth", depth, 2);
+        return cmdTree(files[0], depth);
     }
     if (sub == "nodes") {
         const auto files = positional({});

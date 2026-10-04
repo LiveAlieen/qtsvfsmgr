@@ -12,7 +12,7 @@ constexpr std::size_t kNodeHeader = 44;   // 4+4+8+8+8+8+4
 constexpr std::size_t kBlockEntrySize = 12;
 
 bool isLikelyPath(const std::string& s) {
-    if (s.empty() || s.size() > 1024) {
+    if (s.size() > 1024) {  // 根节点名是空串
         return false;
     }
     for (unsigned char c : s) {
