@@ -211,4 +211,21 @@ bool parseSelfName(const std::uint8_t* data, std::size_t size, SelfName& out) {
     return true;
 }
 
+CatalogStats measureCatalog(const std::uint8_t* data, std::size_t size) {
+    CatalogStats st;
+    st.serialized = serializedHeader(data, size);
+    for (const auto& [off, val] : collectFields(data, size)) {
+        if (pathLike(val)) {
+            ++st.paths;
+        } else if (nameLike(val)) {
+            ++st.names;
+        }
+    }
+    const std::size_t n = std::min<std::size_t>(size, 4);
+    for (std::size_t i = 0; i < n; ++i) {
+        st.magic += (data[i] >= 0x20 && data[i] <= 0x7e) ? static_cast<char>(data[i]) : '.';
+    }
+    return st;
+}
+
 }  // namespace qtsvfs

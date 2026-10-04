@@ -24,11 +24,9 @@ struct CatalogEntry {
 // 扫明文里的「[u32 长度][字符串]」字段，配对 name↔path。data/size 可以是整块解压结果。
 std::vector<CatalogEntry> parseCatalog(const std::uint8_t* data, std::size_t size);
 
-// 单资源节点的自声明名字：这类节点自己就是一个资源的序列化数据，体内只有一个「名字风格」
-// 长度前缀字段（实测包 101 的 1240 个无名节点里 985 个恰好 1 个），紧跟其后的是它引用的
-// 资源流路径。名字来自「就在这个节点体内」这件事，所以不走哈希闸门；目录段取自节点
-// 自己声明的那条路径，属于同一份证据，不是我们编的挂载点。
-// 出现 0 个或 ≥3 个候选（聚合 bundle、动画/音频多对象）时返回 false，交给上一层按哈希退化。
+// 单资源节点的自声明名字：这类节点自己就是一个资源的序列化数据，体内带「名字风格」的
+// 长度前缀字段，紧跟其后的是它引用的资源流路径。名字来自「就在这个节点体内」这件事，
+// 所以不走哈希闸门；目录段取自节点自己声明的那条路径，属于同一份证据，不是我们编的挂载点。
 struct SelfName {
     std::string name;  // 体内声明的资源名（原样，含空格）
     std::string dir;   // 节点声明的资源流路径的目录，形如 assets/29；没有则空
@@ -38,7 +36,18 @@ struct SelfName {
 // confident 判定：体内只有 1 个（或 2 个相同）名字字段 → 直接用。
 // 不 confident 时（包 8 那种 34 万个小资源文件，体内除了资源名还带着色器属性/子对象名）
 // 取「最像资源名」的那个：按 长度 + 2×下划线个数 打分取胜者，且要求体内声明的路径不超过 1 条
-// ——路径一大串就说明这是聚合 bundle，取哪个名字都不对，交给上层按哈希退化。
+// ——路径一大串就说明这是聚合 bundle，取哪个名字都不对，交给上一层按哈希退化。
 bool parseSelfName(const std::uint8_t* data, std::size_t size, SelfName& out);
+
+// 定名失败的分类依据：是不是引擎序列化文件、体内有几个名字字段、声明了几条路径、
+// 以及开头魔数（把 Wwise/CRI/mp4 这类非 Unity 容器分桶用）。
+struct CatalogStats {
+    bool serialized = false;
+    std::size_t names = 0;
+    std::size_t paths = 0;
+    std::string magic;  // 前 4 字节里可打印的部分，不可打印记 '.'
+};
+
+CatalogStats measureCatalog(const std::uint8_t* data, std::size_t size);
 
 }  // namespace qtsvfs

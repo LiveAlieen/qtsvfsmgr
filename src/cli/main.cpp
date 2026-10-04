@@ -815,7 +815,8 @@ void scanInGamePath(const std::string& text, const qtsvfs::FileNode* node, BareS
 int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::uint64_t maxNodeSize,
             const std::string& outTsv, bool append, bool showAll, bool trace, bool bare,
             const qtsvfs::GlobalIndex* gi, const std::vector<std::string>& prefixes,
-            const std::unordered_set<std::uint64_t>* keyset) {
+            const std::unordered_set<std::uint64_t>* keyset, std::ostream* missing,
+            const qtsvfs::NameTable* known) {
     qtsvfs::Package pkg;
     std::string err;
     if (!pkg.open(pkgDir, err)) {
@@ -840,6 +841,7 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
     std::unordered_map<std::string, std::uint64_t> keyFreq;
     std::unordered_map<std::string, std::string> keyExample;
     std::unordered_map<std::string, std::uint64_t> failReason;
+    std::unordered_map<std::string, std::uint64_t> unnamedKind;  // 有字节却没定名的原因分桶
     std::vector<std::array<std::uint64_t, 5>> badSizes;  // hash, 声明, 实得, method, 块数
     BareStats bs;
     ScanStats st;
@@ -874,6 +876,13 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
             if (!pkg.readBlob(*node, blob, de)) {
                 ++st.failed;
                 failReason[de.substr(0, 72)]++;
+                // 「没有数据卷含该节点的块」= 这份按需下载缓存里根本没它的字节，
+                // 列出来才能把「定名率」的分母说清楚，也才查得出是不是索引漏了。
+                if (missing && de.find("没有数据卷") != std::string::npos) {
+                    *missing << std::hex << std::uppercase << std::setw(16) << std::setfill('0')
+                             << node->hash << '\t' << std::dec << node->size << '\t'
+                             << pkgDir.filename().string() << '\n';
+                }
                 continue;
             }
         } catch (const std::exception& e) {
@@ -976,6 +985,20 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
                    << "/" << (sn.dir.empty() ? "" : sn.dir + "/") << sn.name << '\n'
                    << std::dec;
             }
+        }
+        if (known && !known->count(node->hash)) {
+            const auto cs = qtsvfs::measureCatalog(blob.data(), blob.size());
+            std::string kind;
+            if (!cs.serialized) {
+                kind = "非序列化容器 magic=" + cs.magic;
+            } else if (cs.paths > 1) {
+                kind = "聚合 bundle(体内声明 " + std::to_string(cs.paths) + " 条路径)";
+            } else if (cs.names == 0) {
+                kind = "序列化但体内无名字字段";
+            } else {
+                kind = "有名字却没被采纳(名字数 " + std::to_string(cs.names) + ")";
+            }
+            ++unnamedKind[kind];
         }
         if (st.nodes % 1000 == 0) {
             std::printf("  … 已扫 %llu 节点，含标记节点 %llu，自声明 %llu，引用 %llu\n",
@@ -1105,6 +1128,22 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
     }
     if (os) {
         std::printf("  → 命中清单: %s\n", outTsv.c_str());
+    }
+    if (known && !unnamedKind.empty()) {
+        std::vector<std::pair<std::string, std::uint64_t>> kinds(unnamedKind.begin(),
+                                                                 unnamedKind.end());
+        std::sort(kinds.begin(), kinds.end(), [](const auto& a, const auto& b) {
+            return a.second > b.second;
+        });
+        std::uint64_t sum = 0;
+        for (const auto& [k, v] : kinds) {
+            sum += v;
+        }
+        std::printf("  有字节但未定名 %llu 个，按原因分桶:\n", static_cast<unsigned long long>(sum));
+        for (std::size_t i = 0; i < kinds.size() && i < 12; ++i) {
+            std::printf("    %-40s %llu\n", kinds[i].first.c_str(),
+                        static_cast<unsigned long long>(kinds[i].second));
+        }
     }
     return 0;
 }
@@ -1688,11 +1727,15 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "选项解析失败\n");
             return 1;
         }
-        std::string outTsv, gindexPath, pkgRoot, prefixArg, keysetArg;
+        std::string outTsv, gindexPath, pkgRoot, prefixArg, keysetArg, missingTsv, knownArg;
         bool showAll = false, trace = false, bare = false;
         for (const auto& t : rest) {
             if (t.rfind("--out=", 0) == 0) {
                 outTsv = t.substr(6);
+            } else if (t.rfind("--known=", 0) == 0) {
+                knownArg = t.substr(8);
+            } else if (t.rfind("--missing=", 0) == 0) {
+                missingTsv = t.substr(10);
             } else if (t.rfind("--gindex=", 0) == 0) {
                 gindexPath = t.substr(9);
             } else if (t.rfind("--packages=", 0) == 0) {
@@ -1772,9 +1815,29 @@ int main(int argc, char** argv) {
                         gi->fileCount(), 100.0 * static_cast<double>(gi->fileCount()) / 4294967296.0);
         }
         std::size_t done = 0, bad = 0;
+        qtsvfs::NameTable known;
+        if (!knownArg.empty()) {
+            std::string kerr;
+            if (!qtsvfs::loadNameTable(utf8ToPath(knownArg), known, kerr)) {
+                std::fprintf(stderr, "%s\n", kerr.c_str());
+                return 2;
+            }
+            std::printf("已定名集合: %zu 条（用于未定名原因分桶）\n", known.size());
+        }
+        std::ofstream missingOs;
+        std::ostream* missing = nullptr;
+        if (!missingTsv.empty()) {
+            missingOs.open(utf8ToPath(missingTsv), std::ios::binary | std::ios::trunc);
+            if (!missingOs) {
+                std::fprintf(stderr, "写不出 %s\n", missingTsv.c_str());
+                return 3;
+            }
+            missing = &missingOs;
+        }
         for (std::size_t i = 0; i < files.size(); ++i) {
             if (cmdScan(files[i], max, maxsize, outTsv, done > 0, showAll, trace, bare, gi.get(),
-                prefixes, keyset.empty() ? nullptr : &keyset) !=
+                prefixes, keyset.empty() ? nullptr : &keyset, missing,
+                known.empty() ? nullptr : &known) !=
                 0) {
                 std::fprintf(stderr, "跳过 %s\n", wideToUtf8(files[i].native()).c_str());
                 ++bad;
