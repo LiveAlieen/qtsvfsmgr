@@ -74,6 +74,7 @@ private:
     std::filesystem::path pkgDir_;
     std::filesystem::path namesPath_;
     qtsvfs::NameTable names_;
+    qtsvfs::SourceTable sources_;
     std::unique_ptr<PkgHolder> pkg_;
     ExportWorker* worker_ = nullptr;
 };

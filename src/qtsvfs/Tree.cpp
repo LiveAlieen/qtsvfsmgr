@@ -17,7 +17,7 @@ std::uint8_t methodOf(const FileNode& node) {
 }
 
 TreeNode* descend(TreeNode* cur, const std::string& path, bool leafNamed, const FileNode& node,
-                  TreeStats& stats) {
+                  TreeStats& stats, const std::string& source) {
     std::size_t i = 0;
     std::string acc;
     while (i < path.size()) {
@@ -49,6 +49,7 @@ TreeNode* descend(TreeNode* cur, const std::string& path, bool leafNamed, const 
     }
     cur->dir = false;
     cur->named = leafNamed;
+    cur->source = source;
     cur->hash = node.hash;
     cur->size = node.size;
     cur->method = methodOf(node);
@@ -59,7 +60,7 @@ TreeNode* descend(TreeNode* cur, const std::string& path, bool leafNamed, const 
 }  // namespace
 
 void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names, TreeNode& root,
-               TreeStats& stats) {
+               TreeStats& stats, const SourceTable* sources) {
     root.name = "";
     root.path = "";
     root.dir = true;
@@ -68,7 +69,14 @@ void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names
         const auto it = names.find(node->hash);
         const bool named = it != names.end();
         const std::string path = named ? it->second : "/[nameless]/" + hexU64(node->hash);
-        descend(&root, path, named, *node, stats);
+        std::string source;
+        if (named && sources) {
+            const auto s = sources->find(node->hash);
+            if (s != sources->end()) {
+                source = s->second;
+            }
+        }
+        descend(&root, path, named, *node, stats, source);
         ++stats.files;
         stats.bytes += node->size;
         (named ? stats.named : stats.nameless)++;
@@ -96,7 +104,7 @@ void collectRows(const TreeNode& node, std::vector<TreeRow>& rows, std::uint64_t
             }
             continue;
         }
-        rows.push_back({k.path, k.hash, k.size, k.method, k.named});
+        rows.push_back({k.path, k.hash, k.size, k.method, k.named, k.source});
     }
 }
 

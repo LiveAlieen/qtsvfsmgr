@@ -15,6 +15,7 @@ struct TreeNode {
     std::string path;  // 完整虚拟路径；目录以 '/' 结尾
     bool dir = false;
     bool named = false;
+    std::string source;  // 定名来源，见 SourceTable；空=哈希退化
     std::uint64_t hash = 0;
     std::uint64_t size = 0;
     std::uint8_t method = 0;
@@ -32,12 +33,13 @@ struct TreeRow {
     std::uint64_t size = 0;
     std::uint8_t method = 0;
     bool named = false;
+    std::string source;
 };
 
 // 用名字表把包内节点还原成真实目录树。没定名的节点单独收进 [nameless] 桶，
-// 不跟真名混在一起，覆盖率才看得见。
+// 不跟真名混在一起，覆盖率才看得见。sources 可为空，那样只留 named 布尔。
 void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names, TreeNode& root,
-               TreeStats& stats);
+               TreeStats& stats, const SourceTable* sources = nullptr);
 
 // 按「目录在前、名字在后」稳定排序，供界面与文本输出用同一套顺序。
 void sortTree(TreeNode& node);

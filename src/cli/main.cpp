@@ -22,6 +22,7 @@
 #endif
 
 #include "qtsvfs/codec/Codec.h"
+#include "qtsvfs/Catalog.h"
 #include "qtsvfs/Export.h"
 #include "qtsvfs/Names.h"
 #include "qtsvfs/Tree.h"
@@ -517,6 +518,12 @@ struct BareStats {
     std::vector<std::string> examples;
     // 已定名：路径哈希命中包内某个节点（含自身），可直接当真实文件名用
     std::unordered_map<std::uint64_t, std::string> named;
+    // catalog 定名：同一条记录里「资源真名 + 声明路径」成对出现，路径过了哈希闸门后，
+    // 把真名挂到那个节点上。比 named 更接近用户要的「不是哈希树」。
+    std::unordered_map<std::uint64_t, std::string> namedReal;
+    // 节点体内只有一个资源名字段的单资源节点：名字来自「它自己就是那个资源的数据」
+    std::unordered_map<std::uint64_t, std::string> selfNames;
+    std::uint64_t catalogEntries = 0;
     std::uint64_t namedSelf = 0;
     // 候选按「末段扩展名 / 无扩展」分桶，用来看还有哪些文件类型、为什么没命中
     std::unordered_map<std::string, std::array<std::uint64_t, 2>> extStats;  // [候选, 命中]
@@ -598,16 +605,15 @@ std::vector<std::pair<std::string, std::string>> buildForms(const std::string& t
     return out;
 }
 
-void scanBarePaths(const std::string& text, const qtsvfs::FileNode* node, BareStats& bs,
-                   const qtsvfs::GlobalIndex* gi,
-                   const std::unordered_map<std::uint64_t, qtsvfs::FileNode>& nodes,
-                   std::ostream* os, bool recordAll,
-                   const std::vector<std::string>& prefixes,
-                   const std::unordered_set<std::uint64_t>* keyset) {
+// 从明文里取路径候选：除了 ASCII 串，还要取 UTF-16LE（Windows/Wwise/Unity 序列化里
+// 路径常以两字节字符存，中间夹 0x00，ASCII 扫描整段都会漏掉）。
+std::vector<std::string> grabPathTokens(const std::string& text) {
     static const auto ok = [](char c) {
-        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+        const unsigned char u = static_cast<unsigned char>(c);
+        return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') ||
                c == '_' || c == '-' || c == '.' || c == '/' || c == '+';
     };
+    std::vector<std::string> out;
     std::size_t i = 0;
     while (i < text.size()) {
         if (!ok(text[i])) {
@@ -618,8 +624,37 @@ void scanBarePaths(const std::string& text, const qtsvfs::FileNode* node, BareSt
         while (j < text.size() && ok(text[j]) && j - i < 260) {
             ++j;
         }
-        const std::string tok = text.substr(i, j - i);
+        out.push_back(text.substr(i, j - i));
         i = j;
+    }
+    // UTF-16LE：可打印字节后紧跟 0x00
+    i = 0;
+    while (i + 1 < text.size()) {
+        if (!ok(text[i]) || text[i + 1] != '\0') {
+            ++i;
+            continue;
+        }
+        std::string tok;
+        std::size_t k = i;
+        while (k + 1 < text.size() && ok(text[k]) && text[k + 1] == '\0' && tok.size() < 260) {
+            tok += text[k];
+            k += 2;
+        }
+        i = k > i ? k : i + 1;
+        if (tok.size() >= 2 && (tok.find('/') != std::string::npos)) {
+            out.push_back(std::move(tok));
+        }
+    }
+    return out;
+}
+
+void scanBarePaths(const std::string& text, const qtsvfs::FileNode* node, BareStats& bs,
+                   const qtsvfs::GlobalIndex* gi,
+                   const std::unordered_map<std::uint64_t, qtsvfs::FileNode>& nodes,
+                   std::ostream* os, bool recordAll,
+                   const std::vector<std::string>& prefixes,
+                   const std::unordered_set<std::uint64_t>* keyset) {
+    for (const std::string& tok : grabPathTokens(text)) {
         if (tok.size() < 8 || tok.find('/') == std::string::npos) {
             continue;
         }
@@ -682,6 +717,98 @@ void scanBarePaths(const std::string& text, const qtsvfs::FileNode* node, BareSt
                 << (anyHit ? "\tbare\t" : "\tcand\t") << seg << '\t' << tok << '\n'
                 << std::dec;
         }
+    }
+}
+
+// catalog 记录：名字来自同一条记录，节点键来自声明路径的哈希闸门，两者都成立才记。
+void scanCatalog(const std::string& text, const qtsvfs::FileNode* node, BareStats& bs,
+                 const std::unordered_map<std::uint64_t, qtsvfs::FileNode>& nodes, std::ostream* os,
+                 const std::unordered_set<std::uint64_t>* keyset) {
+    const auto entries = qtsvfs::parseCatalog(reinterpret_cast<const std::uint8_t*>(text.data()),
+                                              text.size());
+    bs.catalogEntries += entries.size();
+    for (const auto& e : entries) {
+        std::string lower = e.path;
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        while (!lower.empty() && lower[0] == '/') {
+            lower.erase(lower.begin());
+        }
+        const std::string cand = "/" + lower;
+        const std::uint64_t h = qtsvfs::calcHashCode64(cand);
+        if (h != node->hash && nodes.count(h) == 0 && !(keyset && keyset->count(h))) {
+            continue;  // 声明的路径在这份数据里没有对应节点，名字也就无处可挂
+        }
+        std::string real = e.name;
+        for (char& c : real) {
+            if (c == '/' || c == '\\') {
+                c = '_';
+            }
+        }
+        real += "." + e.ext;
+        const bool fresh = bs.namedReal.try_emplace(h, real).second;
+        if (os && fresh) {
+            *os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h << "\treal\tcatalog\t"
+                << real << '\n'
+                << std::dec;
+        }
+    }
+}
+
+// 脚本节点的自声明模块名：JS 运行时在文件头写 `InGamePath: JS/…/x.mjs`。
+// 这条串以前被判过「不是名字来源」，理由是它哈希不到任何节点键 —— 那是把它当成
+// 「指向别人的路径」才有的要求。它其实是「我这个文件叫什么」，配对依据是包含关系，
+// 不需要哈希闸门；只有在整块明文里只出现 1 个不同取值时才采纳，多了就是引用列表。
+void scanInGamePath(const std::string& text, const qtsvfs::FileNode* node, BareStats& bs,
+                    std::ostream* os) {
+    static const std::string key = "InGamePath:";
+    std::string val;
+    std::size_t distinct = 0;
+    for (std::size_t p = text.find(key); p != std::string::npos; p = text.find(key, p + key.size())) {
+        std::size_t s = p + key.size();
+        while (s < text.size() && text[s] == ' ') {
+            ++s;
+        }
+        std::size_t e = s;
+        static const auto okc = [](char c) {
+            const unsigned char u = static_cast<unsigned char>(c);
+            return (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') || (u >= '0' && u <= '9') ||
+                   c == '_' || c == '-' || c == '.' || c == '/' || c == '+';
+        };
+        while (e < text.size() && okc(text[e]) && e - s < 240) {
+            ++e;
+        }
+        std::string v = text.substr(s, e - s);
+        if (v.size() < 4) {
+            continue;
+        }
+        if (val.empty()) {
+            val = v;
+            ++distinct;
+        } else if (val != v) {
+            ++distinct;
+            break;
+        }
+    }
+    if (distinct != 1) {
+        return;
+    }
+    // 声明形如 `InGamePath: JS//GameScripts/…`，双斜杠是运行时拼出来的，折叠掉。
+    std::string name;
+    for (std::size_t i = 0; i < val.size(); ++i) {
+        if (val[i] == '/' && i + 1 < val.size() && val[i + 1] == '/') {
+            continue;
+        }
+        name += val[i];
+    }
+    if (name.empty() || name[0] != '/') {
+        name = "/" + name;
+    }
+    if (bs.selfNames.try_emplace(node->hash, name).second && os) {
+        *os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << node->hash
+            << "\tobject\tingamepath\t" << name << '\n'
+            << std::dec;
     }
 }
 
@@ -834,6 +961,21 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
         if (bare) {
             scanBarePaths(text, node, bs, gi, pkg.nodes(), os ? &os : nullptr, showAll, prefixes,
                           keyset);
+            scanCatalog(text, node, bs, pkg.nodes(), os ? &os : nullptr, keyset);
+            // 顺序即优先级：脚本节点先看运行时自声明的模块路径，再看序列化资源名。
+            scanInGamePath(text, node, bs, os ? &os : nullptr);
+            qtsvfs::SelfName sn;
+            if (qtsvfs::parseSelfName(blob.data(), blob.size(), sn) &&
+                bs.selfNames
+                    .try_emplace(node->hash,
+                                 "/" + (sn.dir.empty() ? "" : sn.dir + "/") + sn.name)
+                    .second &&
+                os) {
+                os << std::hex << std::uppercase << std::setw(16) << std::setfill('0')
+                   << node->hash << (sn.confident ? "\tobject\tselfname\t" : "\tobject\tobjname\t")
+                   << "/" << (sn.dir.empty() ? "" : sn.dir + "/") << sn.name << '\n'
+                   << std::dec;
+            }
         }
         if (st.nodes % 1000 == 0) {
             std::printf("  … 已扫 %llu 节点，含标记节点 %llu，自声明 %llu，引用 %llu\n",
@@ -895,6 +1037,10 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
                     static_cast<unsigned long long>(bs.named.size()),
                     static_cast<unsigned long long>(bs.selfHit),
                     static_cast<unsigned long long>(bs.refHit));
+        std::printf("  catalog 记录=%llu  其中真名可挂到节点键=%llu  体内单资源名节点=%llu\n",
+                    static_cast<unsigned long long>(bs.catalogEntries),
+                    static_cast<unsigned long long>(bs.namedReal.size()),
+                    static_cast<unsigned long long>(bs.selfNames.size()));
         if (os) {
             for (const auto& [h, p] : bs.named) {
                 os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h
@@ -966,11 +1112,13 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
 int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
               std::uint64_t depthLimit, const std::string& outTsv) {
     qtsvfs::NameTable table;
+    qtsvfs::SourceTable sources;
     std::string err;
-    if (!qtsvfs::loadNameTable(utf8ToPath(namesFile), table, err)) {
+    if (!qtsvfs::loadNameTable(utf8ToPath(namesFile), table, err, &sources)) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
+    qtsvfs::makeUnique(table);
     qtsvfs::Package pkg;
     if (!pkg.open(pkgDir, err) || !pkg.loadNodes(err)) {
         std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
@@ -984,7 +1132,7 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
     }
     qtsvfs::TreeNode root;
     qtsvfs::TreeStats st;
-    qtsvfs::buildTree(nodes, table, root, st);
+    qtsvfs::buildTree(nodes, table, root, st, &sources);
     qtsvfs::sortTree(root);
     std::printf("包 %s：节点 %zu，真名 %llu，未定名 %llu，未压总字节 %llu（名字表 %zu 条）\n",
                 pkgDir.filename().string().c_str(), nodes.size(),
@@ -1014,13 +1162,14 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
 }
 
 int cmdExport(const std::filesystem::path& pkgDir, const std::string& namesFile,
-              const std::string& outDir, std::uint64_t limit) {
+              const std::string& outDir, std::uint64_t limit, bool nameless) {
     qtsvfs::NameTable table;
     std::string err;
     if (!qtsvfs::loadNameTable(utf8ToPath(namesFile), table, err)) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
+    qtsvfs::makeUnique(table);
     qtsvfs::Package pkg;
     if (!pkg.open(pkgDir, err) || !pkg.loadNodes(err)) {
         std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
@@ -1037,7 +1186,8 @@ int cmdExport(const std::filesystem::path& pkgDir, const std::string& namesFile,
                                                   static_cast<unsigned long long>(cur.bytes >> 20));
                                       std::fflush(stdout);
                                   }
-                              });
+                              },
+            nameless);
     std::printf("  → 导出 %llu 个文件共 %llu 字节，失败 %llu，改名 %llu，无名跳过 %llu%s\n",
                 static_cast<unsigned long long>(r.files),
                 static_cast<unsigned long long>(r.bytes),
@@ -1144,6 +1294,123 @@ int cmdGindex(const std::filesystem::path& dataFile, const std::string& namesFil
     return 0;
 }
 
+// 把多份 scan 产出合成一张名字表，同一节点键按来源优先级只留一条：
+//   0 real   —— catalog 记录里的真名（路径过了哈希闸门，名字来自同一条记录）
+//   1 object —— 节点体内自声明（ingamepath/selfname/objname），配对依据是包含关系
+//   2 named  —— 裸路径哈希定名，只有哈希路径可看
+// object 缺目录段而同一键又有 named 时，目录用 named 的（哈希验证过的挂载位置）、
+// 文件段用 object 的（资源自己的名字）。最后统一做同名消歧。
+int cmdMergeNames(const std::vector<std::filesystem::path>& ins, const std::string& outTsv) {
+    struct Best {
+        int rank = 9;
+        std::string tag;
+        std::string sub;
+        std::string path;
+    };
+    std::unordered_map<std::uint64_t, Best> map;
+    std::unordered_map<std::uint64_t, std::string> dirOf;
+    std::map<std::string, std::uint64_t> bySource;
+    for (const auto& f : ins) {
+        std::ifstream in(f);
+        if (!in) {
+            std::fprintf(stderr, "打不开 %s\n", wideToUtf8(f).c_str());
+            return 2;
+        }
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.size() < 18 || line[16] != '\t') {
+                continue;
+            }
+            // 行形如 HASH<TAB>tag<TAB>sub<TAB>path（named 行的 sub 为空）。
+            std::string tag, sub, path;
+            std::size_t t = 17;
+            for (int col = 0; col < 3; ++col) {
+                const std::size_t nx = col == 2 ? std::string::npos : line.find('\t', t);
+                const std::string field =
+                    nx == std::string::npos ? line.substr(t) : line.substr(t, nx - t);
+                if (col == 0) {
+                    tag = field;
+                } else if (col == 1) {
+                    sub = field;
+                } else {
+                    path = field;
+                }
+                if (nx == std::string::npos) {
+                    break;
+                }
+                t = nx + 1;
+            }
+            if (path.empty()) {
+                continue;
+            }
+            if (tag != "real" && tag != "object" && tag != "named") {
+                continue;
+            }
+            const int rank = tag == "real" ? 0 : tag == "object" ? 1 : 2;
+            const std::uint64_t h = std::strtoull(line.substr(0, 16).c_str(), nullptr, 16);
+            if (h == 0) {
+                continue;
+            }
+            if (tag == "named") {
+                const std::size_t slash = path.rfind('/');
+                if (slash != std::string::npos) {
+                    dirOf.try_emplace(h, path.substr(0, slash));
+                }
+            }
+            auto it = map.find(h);
+            if (it == map.end() || rank < it->second.rank) {
+                map[h] = Best{rank, tag, sub, path};
+                bySource[tag + "/" + sub]++;
+            } else {
+                bySource["被更高优先级覆盖"]++;
+            }
+        }
+    }
+
+    for (auto& [h, b] : map) {
+        if (b.rank == 2) {
+            continue;  // named 本身就是完整路径，不需要借目录
+        }
+        const std::size_t slash = b.path.rfind('/');
+        if (slash != std::string::npos && slash != 0) {
+            continue;  // 这条名字已经带了目录段
+        }
+        const auto d = dirOf.find(h);
+        if (d != dirOf.end()) {
+            b.path = d->second + b.path;
+        }
+    }
+
+    qtsvfs::NameTable table;
+    qtsvfs::SourceTable sources;
+    for (const auto& [h, b] : map) {
+        table.emplace(h, b.path);
+        sources.emplace(h, b.sub.empty() ? b.tag : b.tag + ":" + b.sub);
+    }
+    qtsvfs::makeUnique(table);
+    std::ofstream os(utf8ToPath(outTsv));
+    if (!os) {
+        std::fprintf(stderr, "写不出 %s\n", outTsv.c_str());
+        return 3;
+    }
+    for (const auto& [h, p] : table) {
+        const auto s = sources.find(h);
+        const std::string tag = s == sources.end() ? "named" : s->second.substr(0, s->second.find(':'));
+        const std::string sub =
+            s == sources.end() || s->second.find(':') == std::string::npos
+                ? "" : s->second.substr(s->second.find(':') + 1);
+        os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h << '\t' << tag
+           << '\t' << sub << '\t' << p << '\n'
+           << std::dec;
+    }
+    std::printf("合并 %zu 个来源文件 -> %s，共 %zu 个节点定名\n", ins.size(), outTsv.c_str(),
+                table.size());
+    for (const auto& [k, v] : bySource) {
+        std::printf("  %-28s %llu\n", k.c_str(), static_cast<unsigned long long>(v));
+    }
+    return 0;
+}
+
 int cmdProbe(const std::filesystem::path& file, std::uint64_t head_bytes, std::uint64_t sample_bytes,
              std::uint64_t block_bytes) {
     qtsvfs::FileReader fr;
@@ -1210,6 +1477,8 @@ void usage() {
         "  qtsvfs scan <packageDir>...|--packages=<root> [--max=N] [--maxsize=N]\n"
         "                [--bare --gindex=<GlobalIndexPrime.data>] [--out=tsv] [--all] [--trace]\n"
         "                                      批量解块，找自声明并用哈希自校验；--bare 找裸资源路径\n"
+        "  qtsvfs mergenames <tsv>... --out=<名字表>\n"
+        "                                      按 real>object>named 优先级合并 scan 产出并同名消歧\n"
         "  qtsvfs probe <file> [--head=N] [--sample=N] [--block=N]\n"
         "\n"
         "尺寸选项支持 K/M/G 后缀。\n");
@@ -1362,7 +1631,9 @@ int main(int argc, char** argv) {
         }
         std::uint64_t limit = 100000;
         optValue("--limit", limit, 100000);
-        return cmdExport(files[0], names, outDir, limit);
+        const bool nameless = std::any_of(rest.begin(), rest.end(),
+                                          [](const std::string& t) { return t == "--nameless"; });
+        return cmdExport(files[0], names, outDir, limit, nameless);
     }
     if (sub == "keys") {
         std::string outTsv, pkgRoot;
@@ -1564,6 +1835,20 @@ int main(int argc, char** argv) {
         std::uint64_t max = 20;
         optValue("--max", max, 20);
         return cmdNodes(files[0], max);
+    }
+    if (sub == "mergenames") {
+        std::string outTsv;
+        for (const auto& t : rest) {
+            if (t.rfind("--out=", 0) == 0) {
+                outTsv = t.substr(6);
+            }
+        }
+        const auto files = positional({});
+        if (files.empty() || outTsv.empty()) {
+            std::fprintf(stderr, "用法: qtsvfs mergenames <harvest.tsv>... --out=<名字表>\n");
+            return 1;
+        }
+        return cmdMergeNames(files, outTsv);
     }
     if (sub == "probe") {
         std::uint64_t head = 0x100, sample = 16ull * 1024 * 1024, block = 64ull * 1024;

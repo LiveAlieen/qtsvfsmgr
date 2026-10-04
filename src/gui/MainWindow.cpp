@@ -159,9 +159,7 @@ MainWindow::MainWindow() {
     const std::filesystem::path names = findDefaultNames(QApplication::applicationDirPath());
     if (!names.empty()) {
         std::string err;
-        if (qtsvfs::loadNameTable(names, names_, err)) {
-            namesPath_ = names;
-            info_->setText(QString::fromUtf8("名字表 %1 条").arg(names_.size()));
+        if (loadNamesFile(names, err)) {
             statusBar()->showMessage(QString::fromUtf8("已自动加载名字表：%1").arg(qFromPath(names)));
         }
     } else {
@@ -202,10 +200,13 @@ void MainWindow::loadNames() {
 
 bool MainWindow::loadNamesFile(const std::filesystem::path& file, std::string& err) {
     qtsvfs::NameTable table;
-    if (!qtsvfs::loadNameTable(file, table, err)) {
+    qtsvfs::SourceTable sources;
+    if (!qtsvfs::loadNameTable(file, table, err, &sources)) {
         return false;
     }
+    qtsvfs::makeUnique(table);
     names_ = std::move(table);
+    sources_ = std::move(sources);
     namesPath_ = file;
     info_->setText(QString::fromUtf8("名字表 %1 条").arg(names_.size()));
     setStatus(QString::fromUtf8("名字表已加载 %1 条").arg(names_.size()));
@@ -238,7 +239,7 @@ bool MainWindow::openPath(const std::filesystem::path& dir, std::string& err) {
         (void)h;
         holder->nodes.push_back(&n);
     }
-    qtsvfs::buildTree(holder->nodes, names_, holder->root, holder->stats);
+    qtsvfs::buildTree(holder->nodes, names_, holder->root, holder->stats, &sources_);
     qtsvfs::sortTree(holder->root);
     pkgDir_ = dir;
     pkg_ = std::move(holder);
@@ -267,7 +268,18 @@ void MainWindow::fillTree() {
             } else {
                 item->setText(1, human(n.size));
                 item->setText(2, QString::fromUtf8(qtsvfs::methodName(n.method)));
-                item->setText(4, n.named ? QString::fromUtf8("真名") : QString::fromUtf8("哈希名"));
+                // 来源要能说清成立依据：过了哈希闸门的和只靠「名字在本节点体内」的不是一回事
+                static const QHash<QByteArray, const char*> kSourceText = {
+                    {"real:catalog", "真名(catalog)"},
+                    {"object:selfname", "体内自声明"},
+                    {"object:objname", "体内名字(择优)"},
+                    {"object:ingamepath", "模块路径"},
+                    {"named", "哈希路径"},
+                };
+                const auto it = kSourceText.constFind(QByteArray(n.source.c_str()));
+                item->setText(4, it == kSourceText.constEnd()
+                                     ? (n.named ? QString::fromUtf8("已定名") : QString::fromUtf8("哈希名"))
+                                     : QString::fromUtf8(it.value()));
                 if (!n.named) {
                     item->setForeground(4, QBrush(Qt::darkGray));
                 }
@@ -361,7 +373,8 @@ void MainWindow::exportTree() {
     for (const auto& r : rows) {
         ts << QString::fromStdString(r.path) << '\t' << hex16(r.hash) << '\t'
            << QString::number(r.size) << '\t' << QString::number(int(r.method)) << '\t'
-           << (r.named ? QStringLiteral("name") : QStringLiteral("hash")) << '\n';
+           << (r.source.empty() ? (r.named ? QStringLiteral("named") : QStringLiteral("nameless"))
+                                : QString::fromStdString(r.source)) << '\n';
     }
     if (!out.commit()) {
         QMessageBox::warning(this, QString::fromUtf8("写不出文件"), out.errorString());
