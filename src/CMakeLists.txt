@@ -3,6 +3,7 @@ add_library(qtsvfs_core STATIC
     qtsvfs/probe/Probe.cpp
     qtsvfs/format/Kdb.cpp
     qtsvfs/format/PathHash.cpp
+    qtsvfs/format/GlobalIndex.cpp
     qtsvfs/format/QtsfNode.cpp
     qtsvfs/codec/Codec.cpp
     qtsvfs/Package.cpp

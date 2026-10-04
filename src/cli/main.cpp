@@ -16,6 +16,7 @@
 #include <windows.h>
 #endif
 
+#include "qtsvfs/format/GlobalIndex.h"
 #include "qtsvfs/format/Kdb.h"
 #include "qtsvfs/format/QtsfNode.h"
 #include "qtsvfs/Package.h"
@@ -332,6 +333,58 @@ int cmdTree(const std::filesystem::path& pkgDir, std::uint64_t depthLimit,
     return 0;
 }
 
+int cmdGindex(const std::filesystem::path& dataFile, const std::string& namesFile) {
+    qtsvfs::GlobalIndex gi;
+    std::string err;
+    if (!gi.load(dataFile.string(), err)) {
+        std::fprintf(stderr, "加载失败: %s\n", err.c_str());
+        return 2;
+    }
+    const auto& h = gi.header();
+    char hex[32];
+    std::snprintf(hex, sizeof(hex), "%016llX", static_cast<unsigned long long>(h.internalPackageHash));
+    std::printf("formatVersion=%u ver=%u buildId=%llu internalPackageHash=0x%s\n", h.formatVersion,
+                h.ver, static_cast<unsigned long long>(h.buildId), hex);
+    std::printf("numPackages=%u numFiles=%u conflicts=%u method=%u compressed=%u\n", h.numPackages,
+                h.numFiles, h.numConflictFiles, h.compressMethod, h.compressedDataSize);
+    std::printf("数组区条目=%zu\n", gi.fileCount());
+    if (namesFile.empty()) {
+        return 0;
+    }
+    std::ifstream in(namesFile);
+    std::uint64_t total = 0, hitLo = 0, hitHi = 0, miss = 0;
+    std::unordered_map<std::uint32_t, std::uint64_t> perPackage;
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::size_t tab = line.find('\t');
+        if (tab == std::string::npos) {
+            continue;
+        }
+        const std::uint64_t hash = std::strtoull(line.substr(0, tab).c_str(), nullptr, 16);
+        ++total;
+        bool fromLow = false;
+        const std::uint16_t pkg = gi.findPackageByNodeHash(hash, &fromLow);
+        if (pkg == 0xFFFF) {
+            ++miss;
+            continue;
+        }
+        (fromLow ? hitLo : hitHi)++;
+        perPackage[pkg]++;
+        if (total <= 5) {
+            std::printf("  %s -> 包 %u (取%s32位)\n", line.substr(tab + 1).c_str(), pkg,
+                        fromLow ? "低" : "高");
+        }
+    }
+    std::printf("命中 %llu（低32位 %llu / 高32位 %llu），未命中 %llu，共 %llu 条名字\n",
+                static_cast<unsigned long long>(hitLo + hitHi),
+                static_cast<unsigned long long>(hitLo), static_cast<unsigned long long>(hitHi),
+                static_cast<unsigned long long>(miss), static_cast<unsigned long long>(total));
+    for (const auto& [pkg, n] : perPackage) {
+        std::printf("  包 %u: %llu 个已命名文件\n", pkg, static_cast<unsigned long long>(n));
+    }
+    return 0;
+}
+
 int cmdProbe(const std::filesystem::path& file, std::uint64_t head_bytes, std::uint64_t sample_bytes,
              std::uint64_t block_bytes) {
     qtsvfs::FileReader fr;
@@ -388,6 +441,7 @@ void usage() {
         "  qtsvfs hash <path>...                  计算节点哈希 (VFS_CalcHashCode64Raw)\n"
         "  qtsvfs kdb info <file.db>              外层 QtskDB 头\n"
         "  qtsvfs kdb records <file.db> [--max=N] [--hist]   枚举 B+树记录\n"
+        "  qtsvfs gindex <GlobalIndex.data> [--names=tsv]\n"
         "  qtsvfs tree <packageDir> [--depth=N]      用官方 node-index 还原真实文件树\n"
         "  qtsvfs nodes <file.db> [--max=N]          解码 FileNode 与块表\n"
         "  qtsvfs probe <file> [--head=N] [--sample=N] [--block=N]\n"
@@ -501,6 +555,20 @@ int main(int argc, char** argv) {
             }
         }
         return cmdTree(files[0], depth, outNames);
+    }
+    if (sub == "gindex") {
+        const auto files = positional({});
+        if (files.empty()) {
+            std::fprintf(stderr, "gindex 需要 GlobalIndex*.data 文件\n");
+            return 1;
+        }
+        std::string names;
+        for (const auto& t : rest) {
+            if (t.rfind("--names=", 0) == 0) {
+                names = t.substr(8);
+            }
+        }
+        return cmdGindex(files[0], names);
     }
     if (sub == "nodes") {
         const auto files = positional({});
