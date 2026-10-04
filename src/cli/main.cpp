@@ -1038,6 +1038,117 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
     return 0;
 }
 
+// 名单里的路径来自包内明文，可能带 ".."、保留字符或超长段；导出前一律规整，
+// 保证落在 outDir 之内且 Windows 可用。
+std::string safeRelative(const std::string& path) {
+    std::string res;
+    std::size_t i = 0;
+    while (i < path.size()) {
+        while (i < path.size() && (path[i] == '/' || path[i] == '\\')) {
+            ++i;
+        }
+        std::size_t j = i;
+        while (j < path.size() && path[j] != '/' && path[j] != '\\') {
+            ++j;
+        }
+        std::string seg = path.substr(i, j - i);
+        i = j;
+        if (seg.empty() || seg == "." || seg == "..") {
+            continue;
+        }
+        for (char& c : seg) {
+            if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' ||
+                c < 32) {
+                c = '_';
+            }
+        }
+        if (seg.size() > 96) {
+            seg = seg.substr(0, 96);
+        }
+        if (!res.empty()) {
+            res += '/';
+        }
+        res += seg;
+    }
+    return res;
+}
+
+int cmdExport(const std::filesystem::path& pkgDir, const std::string& namesFile,
+              const std::string& outDir, std::uint64_t limit) {
+    std::unordered_map<std::uint64_t, std::string> table;
+    if (!loadNameTable(namesFile, table)) {
+        std::fprintf(stderr, "名字表为空或读不到: %s\n", namesFile.c_str());
+        return 2;
+    }
+    qtsvfs::Package pkg;
+    std::string err;
+    if (!pkg.open(pkgDir, err)) {
+        std::fprintf(stderr, "打开包失败: %s\n", err.c_str());
+        return 2;
+    }
+    if (!pkg.loadNodes(err)) {
+        std::fprintf(stderr, "无 FileNode: %s\n", err.c_str());
+        return 2;
+    }
+    const std::filesystem::path base = utf8ToPath(outDir);
+    std::vector<std::pair<std::uint64_t, std::string>> jobs;
+    for (const auto& [h, node] : pkg.nodes()) {
+        (void)node;
+        const auto it = table.find(h);
+        if (it != table.end()) {
+            jobs.emplace_back(h, it->second);
+        }
+    }
+    std::sort(jobs.begin(), jobs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::printf("包 %s：%zu 节点，其中定名 %zu，导出到 %s\n", pkgDir.filename().string().c_str(),
+                pkg.nodes().size(), jobs.size(), outDir.c_str());
+    std::unordered_set<std::string> used;
+    std::uint64_t done = 0, bytes = 0, fail = 0, dup = 0;
+    for (const auto& [h, path] : jobs) {
+        if (done >= limit) {
+            std::printf("  达到 --limit=%llu，提前结束\n", static_cast<unsigned long long>(limit));
+            break;
+        }
+        std::string rel = safeRelative(path);
+        if (rel.empty()) {
+            rel = toHexU64(h);
+        }
+        if (!used.insert(rel).second) {
+            rel += "#" + toHexU64(h).substr(8, 8);  // 规整后重名：加哈希尾巴，不覆盖已导出的
+            ++dup;
+        }
+        const auto itNode = pkg.nodes().find(h);
+        std::vector<std::uint8_t> blob;
+        std::string e2;
+        if (itNode == pkg.nodes().end() || !pkg.readBlob(itNode->second, blob, e2)) {
+            ++fail;
+            continue;
+        }
+        const std::filesystem::path dst = base / utf8ToPath(rel);
+        std::error_code ec;
+        std::filesystem::create_directories(dst.parent_path(), ec);
+        std::ofstream os(dst, std::ios::binary | std::ios::trunc);
+        if (!os) {
+            ++fail;
+            std::fprintf(stderr, "  写入失败: %s\n", rel.c_str());
+            continue;
+        }
+        os.write(reinterpret_cast<const char*>(blob.data()),
+                 static_cast<std::streamsize>(blob.size()));
+        ++done;
+        bytes += blob.size();
+        if (done % 200 == 0) {
+            std::printf("  … 已导出 %llu 个 (%llu MB)\n", static_cast<unsigned long long>(done),
+                        static_cast<unsigned long long>(bytes >> 20));
+            std::fflush(stdout);
+        }
+    }
+    std::printf("  → 导出 %llu 个文件共 %llu 字节，解包失败 %llu，重名改名 %llu\n",
+                static_cast<unsigned long long>(done), static_cast<unsigned long long>(bytes),
+                static_cast<unsigned long long>(fail), static_cast<unsigned long long>(dup));
+    return 0;
+}
+
 int cmdGindex(const std::filesystem::path& dataFile, const std::string& namesFile) {
     qtsvfs::GlobalIndex gi;
     std::string err;
@@ -1149,6 +1260,10 @@ void usage() {
         "  qtsvfs gindex <GlobalIndex.data> [--names=tsv]\n"
         "  qtsvfs tree <packageDir> [--depth=N]      用官方 node-index 还原真实文件树\n"
         "  qtsvfs nodes <file.db> [--max=N]          解码 FileNode 与块表\n"
+        "  qtsvfs layout <packageDir> --names=<名单> [--depth=N]\n"
+        "                                      用名字表还原真实目录树（未定名标 [nameless]）\n"
+        "  qtsvfs export <packageDir> --names=<名单> --out=<目录> [--limit=N]\n"
+        "                                      按真实路径解包落盘（路径先规整，防 ../ 逃逸）\n"
         "  qtsvfs scan <packageDir>...|--packages=<root> [--max=N] [--maxsize=N]\n"
         "                [--bare --gindex=<GlobalIndexPrime.data>] [--out=tsv] [--all] [--trace]\n"
         "                                      批量解块，找自声明并用哈希自校验；--bare 找裸资源路径\n"
@@ -1283,6 +1398,28 @@ int main(int argc, char** argv) {
             return 1;
         }
         return cmdExtract(files[0], hashHex, outPath);
+    }
+    if (sub == "export") {
+        const auto files = positional({});
+        if (files.empty()) {
+            std::fprintf(stderr, "export 需要包目录参数\n");
+            return 1;
+        }
+        std::string names, outDir;
+        for (const auto& t : rest) {
+            if (t.rfind("--names=", 0) == 0) {
+                names = t.substr(8);
+            } else if (t.rfind("--out=", 0) == 0) {
+                outDir = t.substr(6);
+            }
+        }
+        if (names.empty() || outDir.empty()) {
+            std::fprintf(stderr, "export 需要 --names=<名单> 与 --out=<目录>\n");
+            return 1;
+        }
+        std::uint64_t limit = 100000;
+        optValue("--limit", limit, 100000);
+        return cmdExport(files[0], names, outDir, limit);
     }
     if (sub == "layout") {
         const auto files = positional({});
