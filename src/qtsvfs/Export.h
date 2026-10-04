@@ -21,7 +21,8 @@ struct ExportResult {
 ExportResult exportPackage(Package& pkg, const NameTable& names,
                            const std::filesystem::path& outDir, std::uint64_t limit,
                            const std::function<bool()>& cancel,
-                           const std::function<void(const ExportResult&)>& progress);
+                           const std::function<void(const ExportResult&)>& progress,
+                           bool allowNameless = false);
 
 // 导出单个节点到指定文件（界面上「另存为」用）。
 bool exportOne(Package& pkg, std::uint64_t hash, const std::filesystem::path& dst,

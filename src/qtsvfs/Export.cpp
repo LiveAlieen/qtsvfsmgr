@@ -17,11 +17,12 @@ std::string hexU64(std::uint64_t v) {
 
 ExportResult exportPackage(Package& pkg, const NameTable& names, const std::filesystem::path& outDir,
                            std::uint64_t limit, const std::function<bool()>& cancel,
-                           const std::function<void(const ExportResult&)>& progress) {
+                           const std::function<void(const ExportResult&)>& progress,
+                           bool allowNameless) {
     ExportResult res;
     std::vector<std::pair<std::uint64_t, const FileNode*>> jobs;
     for (const auto& [h, node] : pkg.nodes()) {
-        if (names.count(h)) {
+        if (names.count(h) || allowNameless) {
             jobs.emplace_back(h, &node);
         }
     }
@@ -37,7 +38,10 @@ ExportResult exportPackage(Package& pkg, const NameTable& names, const std::file
             res.cancelled = true;
             break;
         }
-        std::string rel = safeRelative(names.at(h));
+        const auto ni = names.find(h);
+        // 两条分支都必须过 safeRelative：以 '/' 开头的串会被 path::operator/= 当成
+        // 绝对路径替换掉 outDir，实测把 1240 个未定名文件写到了盘根 [nameless]\ 下。
+        std::string rel = safeRelative(ni == names.end() ? "[nameless]/" + hexU64(h) : ni->second);
         if (rel.empty()) {
             rel = hexU64(h);
         }
