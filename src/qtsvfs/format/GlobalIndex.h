@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -28,7 +29,7 @@ struct GlobalIndexHeader {
 
 class GlobalIndex {
 public:
-    bool load(const std::string& path, std::string& err);
+    bool load(const std::filesystem::path& path, std::string& err);
 
     const GlobalIndexHeader& header() const noexcept { return header_; }
     std::size_t fileCount() const noexcept { return hashes_.size(); }

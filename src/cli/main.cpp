@@ -7,9 +7,11 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <regex>
 #include <iomanip>
 #include <initializer_list>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -52,6 +54,18 @@ std::string wideToUtf8(const std::wstring& w) {
     return s;
 #else
     return std::string(w.begin(), w.end());
+#endif
+}
+
+// 选项里拿到的是 UTF-8 串，Windows 下要还原成宽字符路径才能开中文目录。
+std::filesystem::path utf8ToPath(const std::string& s) {
+#ifdef _WIN32
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(n > 0 ? n : 0, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), w.data(), n);
+    return std::filesystem::path(w);
+#else
+    return std::filesystem::path(s);
 #endif
 }
 
@@ -489,8 +503,143 @@ bool markerKeyAt(const std::string& t, std::size_t pos, std::size_t& keyStart, s
     return true;
 }
 
+// 裸路径候选：资源/脚本内容里直接写出的路径串（不依赖前面的键名），
+// 用 GlobalIndex 命中率判定它是不是真的 VFS 路径（u32 命中噪声底约 0.037%）。
+struct BareStats {
+    std::uint64_t cand = 0, hitLo = 0, hitHi = 0, selfHit = 0, refHit = 0;
+    std::unordered_map<std::string, std::uint64_t> formHit;
+    std::unordered_map<std::string, std::uint64_t> segFreq;
+    std::unordered_map<std::string, std::uint64_t> segHit;
+    std::unordered_map<std::uint16_t, std::uint64_t> hitPkg;
+    std::vector<std::string> examples;
+    // 已定名：路径哈希命中包内某个节点（含自身），可直接当真实文件名用
+    std::unordered_map<std::uint64_t, std::string> named;
+    std::uint64_t namedSelf = 0;
+};
+
+bool hasExtension(const std::string& t) {
+    const std::size_t dot = t.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= t.size() || t.size() - dot - 1 > 8) {
+        return false;
+    }
+    for (std::size_t k = dot + 1; k < t.size(); ++k) {
+        if (!std::isalnum(static_cast<unsigned char>(t[k]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string firstSegment(const std::string& t) {
+    std::string s = t;
+    if (!s.empty() && s[0] == '/') {
+        s.erase(s.begin());
+    }
+    const std::size_t slash = s.find('/');
+    return slash == std::string::npos ? s : s.substr(0, slash);
+}
+
+void scanBarePaths(const std::string& text, const qtsvfs::FileNode* node, BareStats& bs,
+                   const qtsvfs::GlobalIndex* gi,
+                   const std::unordered_map<std::uint64_t, qtsvfs::FileNode>& nodes,
+                   std::ostream* os) {
+    static const auto ok = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_' || c == '-' || c == '.' || c == '/' || c == '+';
+    };
+    std::size_t i = 0;
+    while (i < text.size()) {
+        if (!ok(text[i])) {
+            ++i;
+            continue;
+        }
+        std::size_t j = i;
+        while (j < text.size() && ok(text[j]) && j - i < 260) {
+            ++j;
+        }
+        const std::string tok = text.substr(i, j - i);
+        i = j;
+        if (tok.size() < 8 || tok.find('/') == std::string::npos || !hasExtension(tok)) {
+            continue;
+        }
+        ++bs.cand;
+        const std::string seg = firstSegment(tok);
+        bs.segFreq[seg]++;
+        struct Form { const char* name; bool collapse; bool lead; bool lower; };
+        static const Form kForms[] = {
+            {"原样", false, false, false},
+            {"/前缀", false, true, false},
+            {"折叠//", true, false, false},
+            {"/+折叠", true, true, false},
+            {"小写", false, false, true},
+            {"/+小写", false, true, true},
+            {"折叠+小写", true, false, true},
+        };
+        bool anyHit = false;
+        for (const Form& fm : kForms) {
+            std::string cand = tok;
+            if (fm.collapse) {
+                std::string c2;
+                c2.reserve(cand.size());
+                for (std::size_t k = 0; k < cand.size(); ++k) {
+                    if (cand[k] == '/' && k + 1 < cand.size() && cand[k + 1] == '/') {
+                        continue;
+                    }
+                    c2 += cand[k];
+                }
+                cand = std::move(c2);
+            }
+            if (fm.lower) {
+                std::transform(cand.begin(), cand.end(), cand.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+            }
+            if (fm.lead) {
+                cand = "/" + cand;
+            }
+            const std::uint64_t h = qtsvfs::calcHashCode64(cand);
+            bool hit = false;
+            if (gi) {
+                const std::uint16_t pid =
+                    gi->findPackage(static_cast<std::uint32_t>(h & 0xFFFFFFFFu));
+                if (pid != 0xFFFF) {
+                    ++bs.hitLo;
+                    bs.hitPkg[pid]++;
+                }
+                if (gi->findPackage(static_cast<std::uint32_t>(h >> 32)) != 0xFFFF) {
+                    ++bs.hitHi;
+                }
+            }
+            const bool self = h == node->hash;
+            const bool ref = !self && nodes.count(h) != 0;
+            if (self) {
+                hit = true;
+                ++bs.selfHit;
+            }
+            if (ref) {
+                hit = true;
+                ++bs.refHit;
+            }
+            if (hit) {
+                anyHit = true;
+                bs.formHit[fm.name]++;
+                bs.segHit[seg]++;
+                bs.named[h] = cand;  // 后到的不覆盖先到的：先到先得更稳
+                if (bs.examples.size() < 40) {
+                    bs.examples.push_back(std::string(fm.name) + " | " + cand.substr(0, 110));
+                }
+            }
+        }
+        if (anyHit && os) {
+            *os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << node->hash
+                << "\tbare\t" << seg << '\t' << tok << '\n' << std::dec;
+        }
+    }
+}
+
 int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::uint64_t maxNodeSize,
-            const std::string& outTsv, bool append, bool showAll, bool trace) {
+            const std::string& outTsv, bool append, bool showAll, bool trace, bool bare,
+            const qtsvfs::GlobalIndex* gi) {
     qtsvfs::Package pkg;
     std::string err;
     if (!pkg.open(pkgDir, err)) {
@@ -516,6 +665,7 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
     std::unordered_map<std::string, std::string> keyExample;
     std::unordered_map<std::string, std::uint64_t> failReason;
     std::vector<std::array<std::uint64_t, 5>> badSizes;  // hash, 声明, 实得, method, 块数
+    BareStats bs;
     ScanStats st;
     std::ofstream os;
     if (!outTsv.empty()) {
@@ -632,6 +782,9 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
         if (nodeHasMarker) {
             ++st.withMarker;
         }
+        if (bare) {
+            scanBarePaths(text, node, bs, gi, pkg.nodes(), os ? &os : nullptr);
+        }
         if (st.nodes % 1000 == 0) {
             std::printf("  … 已扫 %llu 节点，含标记节点 %llu，自声明 %llu，引用 %llu\n",
                         static_cast<unsigned long long>(st.nodes),
@@ -687,16 +840,208 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
                     keyExample.count(keys[i].first) ? keyExample[keys[i].first].substr(0, 72).c_str()
                                                     : "");
     }
+    if (bare) {
+        std::printf("  哈希可定名节点=%llu（本节点 %llu / 包内他节点 %llu）\n",
+                    static_cast<unsigned long long>(bs.named.size()),
+                    static_cast<unsigned long long>(bs.selfHit),
+                    static_cast<unsigned long long>(bs.refHit));
+        if (os) {
+            for (const auto& [h, p] : bs.named) {
+                os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h
+                   << "\tnamed\t\t" << p << '\n'
+                   << std::dec;
+            }
+        }
+        const double noise = gi ? (static_cast<double>(bs.cand) * 7.0 *
+                                   static_cast<double>(gi->fileCount()) / 4294967296.0)
+                                : 0.0;
+        std::printf("  裸路径候选=%llu  GlobalIndex低32命中=%llu  高32命中=%llu  本节点=%llu  包内他节点=%llu"
+                    "（随机噪声量级约 %.1f）\n",
+                    static_cast<unsigned long long>(bs.cand),
+                    static_cast<unsigned long long>(bs.hitLo),
+                    static_cast<unsigned long long>(bs.hitHi),
+                    static_cast<unsigned long long>(bs.selfHit),
+                    static_cast<unsigned long long>(bs.refHit), noise);
+        std::vector<std::pair<std::uint16_t, std::uint64_t>> pkgs(bs.hitPkg.begin(), bs.hitPkg.end());
+        std::sort(pkgs.begin(), pkgs.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::printf("  GlobalIndex 命中落在哪些全局包号 Top6:");
+        for (std::size_t i = 0; i < pkgs.size() && i < 6; ++i) {
+            std::printf(" %u×%llu", pkgs[i].first, static_cast<unsigned long long>(pkgs[i].second));
+        }
+        std::printf("\n");
+        std::vector<std::pair<std::string, std::uint64_t>> forms(bs.formHit.begin(), bs.formHit.end());
+        std::sort(forms.begin(), forms.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        for (const auto& f : forms) {
+            std::printf("    形式 %-12s %llu\n", f.first.c_str(),
+                        static_cast<unsigned long long>(f.second));
+        }
+        std::vector<std::pair<std::string, std::uint64_t>> segs(bs.segFreq.begin(), bs.segFreq.end());
+        std::sort(segs.begin(), segs.end(), [](const auto& a, const auto& b) {
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+        std::printf("  首段 Top12（候选数 | 命中数）:\n");
+        for (std::size_t i = 0; i < segs.size() && i < 12; ++i) {
+            std::printf("    %-28s %-8llu %llu\n", segs[i].first.substr(0, 28).c_str(),
+                        static_cast<unsigned long long>(segs[i].second),
+                        static_cast<unsigned long long>(bs.segHit.count(segs[i].first)
+                                                            ? bs.segHit[segs[i].first]
+                                                            : 0));
+        }
+        for (std::size_t i = 0; i < bs.examples.size() && i < 12; ++i) {
+            std::printf("    例: %s\n", bs.examples[i].c_str());
+        }
+    }
     if (os) {
         std::printf("  → 命中清单: %s\n", outTsv.c_str());
     }
     return 0;
 }
 
+// 名字表：兼容 tree 的 "HASH\tPATH" 与 scan 的 "HASH\tnamed\t\tPATH" 两种行。
+bool loadNameTable(const std::string& file, std::unordered_map<std::uint64_t, std::string>& out) {
+    std::ifstream in(file);
+    if (!in) {
+        return false;
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::size_t t1 = line.find('\t');
+        if (t1 == std::string::npos || t1 != 16) {
+            continue;
+        }
+        std::string path;
+        const std::size_t t2 = line.find('\t', t1 + 1);
+        if (t2 == std::string::npos) {
+            path = line.substr(t1 + 1);
+        } else if (line.compare(t1 + 1, t2 - t1 - 1, "named") == 0) {
+            // scan 写的是 HASH\tnamed\t\tpath：第三字段留空，所以 path 紧跟第三个制表符。
+            const std::size_t t3 = line.find('\t', t2 + 1);
+            path = t3 == std::string::npos ? "" : line.substr(t3 + 1);
+        } else {
+            continue;
+        }
+        if (path.empty()) {
+            continue;
+        }
+        const std::uint64_t h = std::strtoull(line.substr(0, 16).c_str(), nullptr, 16);
+        out.emplace(h, std::move(path));
+    }
+    return !out.empty();
+}
+
+struct LayoutNode {
+    std::string name;
+    bool dir = false;
+    std::uint64_t hash = 0;
+    std::uint64_t size = 0;
+    std::uint8_t method = 0;
+    bool named = false;
+    std::map<std::string, LayoutNode> kids;
+};
+
+void insertPath(LayoutNode& root, const std::string& path, const qtsvfs::FileNode& node,
+                bool named) {
+    LayoutNode* cur = &root;
+    std::size_t i = 0;
+    while (i < path.size()) {
+        while (i < path.size() && path[i] == '/') {
+            ++i;
+        }
+        std::size_t j = i;
+        while (j < path.size() && path[j] != '/') {
+            ++j;
+        }
+        if (j == i) {
+            break;
+        }
+        const std::string seg = path.substr(i, j - i);
+        auto it = cur->kids.find(seg);
+        if (it == cur->kids.end()) {
+            LayoutNode n;
+            n.name = seg;
+            n.dir = true;  // 先当目录，末段再落成文件
+            it = cur->kids.emplace(seg, std::move(n)).first;
+        }
+        cur = &it->second;
+        i = j;
+    }
+    cur->dir = false;
+    cur->hash = node.hash;
+    cur->size = node.size;
+    cur->method = node.blocks.empty() ? 0 : static_cast<std::uint8_t>(node.blocks[0].packed & 0xFFu);
+    cur->named = named;
+}
+
+void printLayout(const LayoutNode& n, int depth, std::uint64_t& files, std::uint64_t& dirs,
+                 std::uint64_t& nameless, std::uint64_t limit) {
+    for (const auto& [key, c] : n.kids) {
+        for (int i = 0; i < depth; ++i) {
+            std::printf("  ");
+        }
+        if (c.dir) {
+            ++dirs;
+            std::printf("%s/\n", c.name.c_str());
+            if (static_cast<std::uint64_t>(depth) < limit) {
+                printLayout(c, depth + 1, files, dirs, nameless, limit);
+            }
+        } else {
+            ++files;
+            if (!c.named) {
+                ++nameless;
+            }
+            std::printf("%s  %016llX size=%llu m=%u%s\n", c.name.c_str(),
+                        static_cast<unsigned long long>(c.hash),
+                        static_cast<unsigned long long>(c.size), c.method,
+                        c.named ? "" : "  [nameless]");
+        }
+    }
+}
+
+int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
+              std::uint64_t depthLimit) {
+    std::unordered_map<std::uint64_t, std::string> table;
+    if (!loadNameTable(namesFile, table)) {
+        std::fprintf(stderr, "名字表为空或读不到: %s\n", namesFile.c_str());
+        return 2;
+    }
+    qtsvfs::Package pkg;
+    std::string err;
+    if (!pkg.open(pkgDir, err)) {
+        std::fprintf(stderr, "打开包失败: %s\n", err.c_str());
+        return 2;
+    }
+    if (!pkg.loadNodes(err)) {
+        std::fprintf(stderr, "无 FileNode: %s\n", err.c_str());
+        return 2;
+    }
+    LayoutNode root;
+    root.dir = true;
+    std::uint64_t named = 0;
+    for (const auto& [h, node] : pkg.nodes()) {
+        const auto it = table.find(h);
+        insertPath(root, it == table.end() ? "/[nameless]/" + toHexU64(h) : it->second, node,
+                   it != table.end());
+        if (it != table.end()) {
+            ++named;
+        }
+    }
+    std::printf("包 %s：节点 %zu，名字表命中 %llu，未定名 %llu（名字表共 %zu 条）\n",
+                pkgDir.filename().string().c_str(), pkg.nodes().size(),
+                static_cast<unsigned long long>(named),
+                static_cast<unsigned long long>(pkg.nodes().size() - named), table.size());
+    std::uint64_t files = 0, dirs = 0, nameless = 0;
+    printLayout(root, 0, files, dirs, nameless, depthLimit);
+    std::printf("  → 目录 %llu，文件 %llu，其中未定名 %llu\n",
+                static_cast<unsigned long long>(dirs), static_cast<unsigned long long>(files),
+                static_cast<unsigned long long>(nameless));
+    return 0;
+}
+
 int cmdGindex(const std::filesystem::path& dataFile, const std::string& namesFile) {
     qtsvfs::GlobalIndex gi;
     std::string err;
-    if (!gi.load(dataFile.string(), err)) {
+    if (!gi.load(dataFile, err)) {
         std::fprintf(stderr, "加载失败: %s\n", err.c_str());
         return 2;
     }
@@ -804,8 +1149,9 @@ void usage() {
         "  qtsvfs gindex <GlobalIndex.data> [--names=tsv]\n"
         "  qtsvfs tree <packageDir> [--depth=N]      用官方 node-index 还原真实文件树\n"
         "  qtsvfs nodes <file.db> [--max=N]          解码 FileNode 与块表\n"
-        "  qtsvfs scan <packageDir>... [--max=N] [--maxsize=N] [--out=tsv]\n"
-        "                                      批量解块并哈希自校验包内自声明路径\n"
+        "  qtsvfs scan <packageDir>...|--packages=<root> [--max=N] [--maxsize=N]\n"
+        "                [--bare --gindex=<GlobalIndexPrime.data>] [--out=tsv] [--all] [--trace]\n"
+        "                                      批量解块，找自声明并用哈希自校验；--bare 找裸资源路径\n"
         "  qtsvfs probe <file> [--head=N] [--sample=N] [--block=N]\n"
         "\n"
         "尺寸选项支持 K/M/G 后缀。\n");
@@ -938,33 +1284,89 @@ int main(int argc, char** argv) {
         }
         return cmdExtract(files[0], hashHex, outPath);
     }
-    if (sub == "scan") {
+    if (sub == "layout") {
         const auto files = positional({});
         if (files.empty()) {
-            std::fprintf(stderr, "scan 需要包目录参数，如 packages/7\n");
+            std::fprintf(stderr, "layout 需要包目录参数，如 packages/101\n");
             return 1;
         }
+        std::string names;
+        for (const auto& t : rest) {
+            if (t.rfind("--names=", 0) == 0) {
+                names = t.substr(8);
+            }
+        }
+        if (names.empty()) {
+            std::fprintf(stderr, "layout 需要 --names=<hash→path 名单>\n");
+            return 1;
+        }
+        std::uint64_t depth = 3;
+        optValue("--depth", depth, 3);
+        return cmdLayout(files[0], names, depth);
+    }
+    if (sub == "scan") {
+        auto files = positional({});
         std::uint64_t max = 300, maxsize = 64ull * 1024 * 1024;
         if (!optValue("--max", max, 300) || !optValue("--maxsize", maxsize, 64ull * 1024 * 1024)) {
             std::fprintf(stderr, "选项解析失败\n");
             return 1;
         }
-        std::string outTsv;
-        bool showAll = false, trace = false;
+        std::string outTsv, gindexPath, pkgRoot;
+        bool showAll = false, trace = false, bare = false;
         for (const auto& t : rest) {
             if (t.rfind("--out=", 0) == 0) {
                 outTsv = t.substr(6);
+            } else if (t.rfind("--gindex=", 0) == 0) {
+                gindexPath = t.substr(9);
+            } else if (t.rfind("--packages=", 0) == 0) {
+                pkgRoot = t.substr(11);
             } else if (t == "--all") {
                 showAll = true;
             } else if (t == "--trace") {
                 trace = true;
+            } else if (t == "--bare") {
+                bare = true;
             }
         }
-        for (std::size_t i = 0; i < files.size(); ++i) {
-            if (cmdScan(files[i], max, maxsize, outTsv, i > 0, showAll, trace) != 0) {
+        // 全库扫描时 1748 个目录参数会超 Windows 命令行上限，自己枚举。
+        if (!pkgRoot.empty()) {
+            for (const auto& e : std::filesystem::directory_iterator(utf8ToPath(pkgRoot))) {
+                if (e.is_directory()) {
+                    files.push_back(e.path());
+                }
+            }
+            std::sort(files.begin(), files.end());
+        }
+        if (files.empty()) {
+            std::fprintf(stderr, "scan 需要包目录参数或 --packages=<目录>\n");
+            return 1;
+        }
+        std::unique_ptr<qtsvfs::GlobalIndex> gi;
+        if (bare) {
+            if (gindexPath.empty()) {
+                std::fprintf(stderr, "--bare 需要 --gindex=<GlobalIndexPrime.data> 做命中率判定\n");
+                return 1;
+            }
+            gi = std::make_unique<qtsvfs::GlobalIndex>();
+            std::string gerr;
+            if (!gi->load(utf8ToPath(gindexPath), gerr)) {
+                std::fprintf(stderr, "GlobalIndex 加载失败: %s\n", gerr.c_str());
                 return 2;
             }
+            std::printf("GlobalIndex: %s 文件项=%zu 噪声底约 %.3f%%\n", gindexPath.c_str(),
+                        gi->fileCount(), 100.0 * static_cast<double>(gi->fileCount()) / 4294967296.0);
         }
+        std::size_t done = 0, bad = 0;
+        for (std::size_t i = 0; i < files.size(); ++i) {
+            if (cmdScan(files[i], max, maxsize, outTsv, done > 0, showAll, trace, bare, gi.get()) !=
+                0) {
+                std::fprintf(stderr, "跳过 %s\n", wideToUtf8(files[i].native()).c_str());
+                ++bad;
+                continue;
+            }
+            ++done;
+        }
+        std::printf("扫描完成 %zu 个包，跳过 %zu 个（非包目录或打不开）\n", done, bad);
         return 0;
     }
     if (sub == "gindex") {

@@ -19,17 +19,17 @@ std::uint16_t le16(const std::uint8_t* p) {
 }
 }  // namespace
 
-bool GlobalIndex::load(const std::string& path, std::string& err) {
+bool GlobalIndex::load(const std::filesystem::path& path, std::string& err) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
-        err = "打不开: " + path;
+        err = "打不开: " + path.string();
         return false;
     }
     const auto fileSize = static_cast<std::size_t>(f.tellg());
     f.seekg(0);
     std::vector<std::uint8_t> buf(fileSize);
     if (!f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(fileSize))) {
-        err = "读取失败: " + path;
+        err = "读取失败: " + path.string();
         return false;
     }
     if (fileSize < kHeaderSize) {
