@@ -42,14 +42,17 @@ bool pathLike(const std::string& s) {
     return true;
 }
 
-// 资源真名：不含 '/'、不含 '.'（带点的是版本号/文件名那类字段）、必须有字母。
+// 资源真名：不含 '/'、不含 '.'（带点的是版本号/文件名那类字段）。
 // 首字符是 '_' 的排除掉：那是着色器属性/关键字（_HSVConversionMatrix_B、_SGAME_POINT_LIGHT_ON），
 // 实测包 8 里这类串会以 2.8 万次的量级重复出现，当成文件名等于什么都没定名。
+// 纯数字也算名字（包 305000000906 那批资源的名字槽里放的就是资源号 100502/190360），
+// 但打分时带字母的必须压过纯数字，见 parseSelfName。
 bool nameLike(const std::string& s) {
     if (s.size() < 3 || s.size() > 64 || s[0] == '_' || s.find('.') != std::string::npos) {
         return false;
     }
     bool letter = false;
+    bool digit = false;
     for (char c : s) {
         const unsigned char u = static_cast<unsigned char>(c);
         const bool ok = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
@@ -61,8 +64,11 @@ bool nameLike(const std::string& s) {
         if ((u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z')) {
             letter = true;
         }
+        if (u >= '0' && u <= '9') {
+            digit = true;
+        }
     }
-    return letter;
+    return letter || (digit && s.size() >= 4);
 }
 
 // 只有「引擎序列化资源文件」才允许拿体内字段当文件名：这类文件的头 64 字节里带
@@ -182,16 +188,22 @@ bool parseSelfName(const std::uint8_t* data, std::size_t size, SelfName& out) {
     if (!single) {
         // 子对象名（source、Bone007、_TINTCOLOR_ON、Dead）普遍比资源名短且少分段，
         // 按 长度+2×下划线 取胜者，实测包 8 会选 EF_zxq_lobby_51703_149 而不是 _TINTCOLOR_ON。
+        // 带字母的加固定权重，保证纯资源号（100502）只在没有别的候选时才用。
         auto score = [](const std::string& s) {
             std::size_t us = 0;
+            bool letter = false;
             for (char c : s) {
                 if (c == '_') {
                     ++us;
                 }
+                const unsigned char u = static_cast<unsigned char>(c);
+                if ((u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z')) {
+                    letter = true;
+                }
             }
-            return s.size() + 2 * us;
+            return s.size() + 2 * us + (letter ? 1000u : 0u);
         };
-        std::size_t best = score(**names.begin());
+        std::size_t best = score(*names.front());
         for (const std::string* p : names) {
             if (score(*p) > best) {
                 best = score(*p);
