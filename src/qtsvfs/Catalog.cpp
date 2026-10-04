@@ -210,6 +210,11 @@ bool parseSelfName(const std::uint8_t* data, std::size_t size, SelfName& out) {
                 pick = p;
             }
         }
+        // 择优到 5 个字符以下说明体内根本没有像样的名字，那是二进制里的巧合片段
+        // （实测界面上出现过 D_、(vo、)dl 这种），宁可留哈希名也别造假名字。
+        if (pick->size() < 6) {
+            return false;
+        }
     }
     out.confident = single;
     out.name = *pick;

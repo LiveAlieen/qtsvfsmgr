@@ -1385,6 +1385,13 @@ int cmdMergeNames(const std::vector<std::filesystem::path>& ins, const std::stri
             if (tag != "real" && tag != "object" && tag != "named") {
                 continue;
             }
+            if (tag == "object" && sub == "objname") {
+                // 旧收割里择优挑出的碎串（D_、(vo）没带长度信息，在合并端补同一道闸
+                const std::size_t slash = path.rfind('/');
+                if (path.size() - (slash == std::string::npos ? 1 : slash + 1) < 6) {
+                    continue;
+                }
+            }
             const int rank = tag == "real" ? 0 : tag == "object" ? 1 : 2;
             const std::uint64_t h = std::strtoull(line.substr(0, 16).c_str(), nullptr, 16);
             if (h == 0) {
