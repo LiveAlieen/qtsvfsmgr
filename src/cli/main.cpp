@@ -1026,7 +1026,7 @@ int cmdExport(const std::filesystem::path& pkgDir, const std::string& namesFile,
         std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
         return 2;
     }
-    std::printf("包 %s：%zu 节点，其中定名 %zu，导出到 %s\n", pkgDir.filename().string().c_str(),
+    std::printf("包 %s：%zu 节点，名字表 %zu 条，导出到 %s\n", pkgDir.filename().string().c_str(),
                 pkg.nodes().size(), table.size(), outDir.c_str());
     const qtsvfs::ExportResult r =
         qtsvfs::exportPackage(pkg, table, utf8ToPath(outDir), limit, nullptr,
