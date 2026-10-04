@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
@@ -245,9 +246,16 @@ int cmdRaw(const std::filesystem::path& p, const std::string& keyHex, std::uint6
                 return true;
             }
             ++found;
-            std::printf("@0x%08X key=%016llX h2=%s keylen=%u vallen=%u\n", r.offset,
+            std::printf("@0x%08X key=%016llX h2=%s keylen=%u vallen=%u", r.offset,
                         static_cast<unsigned long long>(k), toHexU32(r.hash2).c_str(), r.keyLen,
                         r.valueLen);
+            if (r.key.size() >= 16) {
+                std::uint32_t blk = 0, pg = 0;
+                std::memcpy(&blk, r.key.data() + 8, 4);
+                std::memcpy(&pg, r.key.data() + 12, 4);
+                std::printf("  block=%u page=%u", blk, pg);
+            }
+            std::printf("\n");
             std::fputs(qtsvfs::hexdump(r.value.data(), std::min<std::size_t>(r.value.size(), headBytes), 0)
                            .c_str(),
                        stdout);
@@ -507,6 +515,7 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
     std::unordered_map<std::string, std::uint64_t> keyFreq;
     std::unordered_map<std::string, std::string> keyExample;
     std::unordered_map<std::string, std::uint64_t> failReason;
+    std::vector<std::array<std::uint64_t, 5>> badSizes;  // hash, 声明, 实得, method, 块数
     ScanStats st;
     std::ofstream os;
     if (!outTsv.empty()) {
@@ -549,6 +558,13 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
         ++st.decoded;
         if (blob.size() != node->size) {
             ++st.sizeMismatch;
+            if (badSizes.size() < 6) {
+                badSizes.push_back({node->hash, node->size, blob.size(),
+                                    node->blocks.empty() ? 0u
+                                                          : static_cast<unsigned>(
+                                                                node->blocks[0].packed & 0xFFu),
+                                    node->blockCount});
+            }
         }
         const double r = printableRatio(blob);
         st.ratio[r < 0.5 ? 0 : r < 0.7 ? 1 : r < 0.85 ? 2 : r < 0.95 ? 3 : 4]++;
@@ -644,6 +660,13 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
                 static_cast<unsigned long long>(st.ratio[3]),
                 static_cast<unsigned long long>(st.ratio[4]),
                 static_cast<unsigned long long>(st.sizeMismatch));
+    for (const auto& b : badSizes) {
+        std::printf("    尺寸不符 %016llX 声明=%llu 实得=%llu method=%llu 块数=%llu\n",
+                    static_cast<unsigned long long>(b[0]),
+                    static_cast<unsigned long long>(b[1]), static_cast<unsigned long long>(b[2]),
+                    static_cast<unsigned long long>(b[3]),
+                    static_cast<unsigned long long>(b[4]));
+    }
     std::vector<std::pair<std::string, std::uint64_t>> fails(failReason.begin(), failReason.end());
     std::sort(fails.begin(), fails.end(), [](const auto& a, const auto& b) {
         return a.second > b.second;

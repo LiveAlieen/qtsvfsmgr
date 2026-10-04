@@ -122,6 +122,9 @@ std::uint64_t KdbFile::forEachRecord(const std::function<bool(const KdbRecord&)>
     std::uint64_t seen = 0;
     std::vector<std::uint32_t> stack;
     std::unordered_set<std::uint32_t> visited;
+    // 两棵根（@16 与 @20）会指向同一批记录：实测包 7 的数据卷里同一页记录被两个叶子
+    // 引用，重复入表后解出来的长度正好是声明值的 2 倍。按记录偏移去重。
+    std::unordered_set<std::uint32_t> recSeen;
     std::vector<std::uint8_t> page;
 
     // 元数据卷的根在 @16，数据卷的根常在 @20（@16 可能是尚未使用的空页），两个都作为入口。
@@ -151,7 +154,7 @@ std::uint64_t KdbFile::forEachRecord(const std::function<bool(const KdbRecord&)>
         if (flags & 1) {
             for (std::uint32_t i = 0; i < count; ++i) {
                 const std::uint32_t recOff = le32(page.data() + kSlotRefs + i * 4);
-                if (recOff == kKdbNull) {
+                if (recOff == kKdbNull || !recSeen.insert(recOff).second) {
                     continue;
                 }
                 KdbRecord rec;

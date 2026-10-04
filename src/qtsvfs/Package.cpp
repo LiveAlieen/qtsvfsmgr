@@ -136,11 +136,58 @@ bool Package::readBlob(const FileNode& node, std::vector<std::uint8_t>& out, std
         if (a.second.block != b.second.block) {
             return a.second.block < b.second.block;
         }
-        return a.second.page < b.second.page;
+        if (a.second.page != b.second.page) {
+            return a.second.page < b.second.page;
+        }
+        return a.second.offset < b.second.offset;
     });
+    // 同一个 (block,page) 键可能留着多份历史页记录（实测包 117 节点 C6AABBB3BC88C681：
+    // page1 有两份，声明 14059 与 14051，而节点总长 30443 = 16384 + 14059）。
+    // 用块表来定性：非尾页应等于 blockSize，尾页等于 节点长度 - 已拼长度。
+    struct Group {
+        Volume* vol;
+        BlockRef ref;
+        std::vector<BlockRef> candidates;
+    };
+    std::vector<Group> groups;
+    for (const auto& [vol, ref] : all) {
+        if (!groups.empty() && groups.back().ref.block == ref.block &&
+            groups.back().ref.page == ref.page) {
+            groups.back().candidates.push_back(ref);
+            continue;
+        }
+        Group g;
+        g.vol = vol;
+        g.ref = ref;
+        g.candidates.push_back(ref);
+        groups.push_back(std::move(g));
+    }
+    std::vector<std::pair<Volume*, BlockRef>> picked;
+    picked.reserve(groups.size());
+    std::uint64_t acc = 0;
+    for (std::size_t gi = 0; gi < groups.size(); ++gi) {
+        Group& g = groups[gi];
+        const std::uint64_t pageSize = g.ref.block < node.blocks.size() ? node.blocks[g.ref.block].blockSize
+                                                                       : 0;
+        const bool last = gi + 1 == groups.size();
+        const std::uint64_t expect =
+            last ? (node.size > acc ? node.size - acc : 0) : pageSize;
+        const BlockRef* chosen = &g.candidates.front();
+        if (g.candidates.size() > 1) {
+            for (const auto& c : g.candidates) {
+                if (c.declaredSize == expect) {
+                    chosen = &c;
+                    break;
+                }
+            }
+        }
+        picked.emplace_back(g.vol, *chosen);
+        acc += chosen->declaredSize;
+    }
+
     out.clear();
     KdbRecord rec;
-    for (const auto& [vol, ref] : all) {
+    for (const auto& [vol, ref] : picked) {
         std::string readErr;
         if (!vol->db.readRecord(ref.offset, rec, readErr)) {
             err = "块记录读取失败 @0x" + std::to_string(ref.offset) + ": " + readErr;
