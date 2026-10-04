@@ -22,6 +22,9 @@
 #endif
 
 #include "qtsvfs/codec/Codec.h"
+#include "qtsvfs/Export.h"
+#include "qtsvfs/Names.h"
+#include "qtsvfs/Tree.h"
 #include "qtsvfs/format/GlobalIndex.h"
 #include "qtsvfs/format/Kdb.h"
 #include "qtsvfs/format/QtsfNode.h"
@@ -960,256 +963,91 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
     return 0;
 }
 
-// 名字表：兼容 tree 的 "HASH\tPATH" 与 scan 的 "HASH\tnamed\t\tPATH" 两种行。
-bool loadNameTable(const std::string& file, std::unordered_map<std::uint64_t, std::string>& out) {
-    std::ifstream in(file);
-    if (!in) {
-        return false;
-    }
-    std::string line;
-    while (std::getline(in, line)) {
-        const std::size_t t1 = line.find('\t');
-        if (t1 == std::string::npos || t1 != 16) {
-            continue;
-        }
-        std::string path;
-        const std::size_t t2 = line.find('\t', t1 + 1);
-        if (t2 == std::string::npos) {
-            path = line.substr(t1 + 1);
-        } else if (line.compare(t1 + 1, t2 - t1 - 1, "named") == 0) {
-            // scan 写的是 HASH\tnamed\t\tpath：第三字段留空，所以 path 紧跟第三个制表符。
-            const std::size_t t3 = line.find('\t', t2 + 1);
-            path = t3 == std::string::npos ? "" : line.substr(t3 + 1);
-        } else {
-            continue;
-        }
-        if (path.empty()) {
-            continue;
-        }
-        const std::uint64_t h = std::strtoull(line.substr(0, 16).c_str(), nullptr, 16);
-        out.emplace(h, std::move(path));
-    }
-    return !out.empty();
-}
-
-struct LayoutNode {
-    std::string name;
-    bool dir = false;
-    std::uint64_t hash = 0;
-    std::uint64_t size = 0;
-    std::uint8_t method = 0;
-    bool named = false;
-    std::map<std::string, LayoutNode> kids;
-};
-
-void insertPath(LayoutNode& root, const std::string& path, const qtsvfs::FileNode& node,
-                bool named) {
-    LayoutNode* cur = &root;
-    std::size_t i = 0;
-    while (i < path.size()) {
-        while (i < path.size() && path[i] == '/') {
-            ++i;
-        }
-        std::size_t j = i;
-        while (j < path.size() && path[j] != '/') {
-            ++j;
-        }
-        if (j == i) {
-            break;
-        }
-        const std::string seg = path.substr(i, j - i);
-        auto it = cur->kids.find(seg);
-        if (it == cur->kids.end()) {
-            LayoutNode n;
-            n.name = seg;
-            n.dir = true;  // 先当目录，末段再落成文件
-            it = cur->kids.emplace(seg, std::move(n)).first;
-        }
-        cur = &it->second;
-        i = j;
-    }
-    cur->dir = false;
-    cur->hash = node.hash;
-    cur->size = node.size;
-    cur->method = node.blocks.empty() ? 0 : static_cast<std::uint8_t>(node.blocks[0].packed & 0xFFu);
-    cur->named = named;
-}
-
-void printLayout(const LayoutNode& n, int depth, std::uint64_t& files, std::uint64_t& dirs,
-                 std::uint64_t& nameless, std::uint64_t limit) {
-    for (const auto& [key, c] : n.kids) {
-        for (int i = 0; i < depth; ++i) {
-            std::printf("  ");
-        }
-        if (c.dir) {
-            ++dirs;
-            std::printf("%s/\n", c.name.c_str());
-            if (static_cast<std::uint64_t>(depth) < limit) {
-                printLayout(c, depth + 1, files, dirs, nameless, limit);
-            }
-        } else {
-            ++files;
-            if (!c.named) {
-                ++nameless;
-            }
-            std::printf("%s  %016llX size=%llu m=%u%s\n", c.name.c_str(),
-                        static_cast<unsigned long long>(c.hash),
-                        static_cast<unsigned long long>(c.size), c.method,
-                        c.named ? "" : "  [nameless]");
-        }
-    }
-}
-
 int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
-              std::uint64_t depthLimit) {
-    std::unordered_map<std::uint64_t, std::string> table;
-    if (!loadNameTable(namesFile, table)) {
-        std::fprintf(stderr, "名字表为空或读不到: %s\n", namesFile.c_str());
+              std::uint64_t depthLimit, const std::string& outTsv) {
+    qtsvfs::NameTable table;
+    std::string err;
+    if (!qtsvfs::loadNameTable(utf8ToPath(namesFile), table, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
     qtsvfs::Package pkg;
-    std::string err;
-    if (!pkg.open(pkgDir, err)) {
-        std::fprintf(stderr, "打开包失败: %s\n", err.c_str());
+    if (!pkg.open(pkgDir, err) || !pkg.loadNodes(err)) {
+        std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
         return 2;
     }
-    if (!pkg.loadNodes(err)) {
-        std::fprintf(stderr, "无 FileNode: %s\n", err.c_str());
-        return 2;
+    std::vector<const qtsvfs::FileNode*> nodes;
+    nodes.reserve(pkg.nodes().size());
+    for (const auto& [h, n] : pkg.nodes()) {
+        (void)h;
+        nodes.push_back(&n);
     }
-    LayoutNode root;
-    root.dir = true;
-    std::uint64_t named = 0;
-    for (const auto& [h, node] : pkg.nodes()) {
-        const auto it = table.find(h);
-        insertPath(root, it == table.end() ? "/[nameless]/" + toHexU64(h) : it->second, node,
-                   it != table.end());
-        if (it != table.end()) {
-            ++named;
+    qtsvfs::TreeNode root;
+    qtsvfs::TreeStats st;
+    qtsvfs::buildTree(nodes, table, root, st);
+    qtsvfs::sortTree(root);
+    std::printf("包 %s：节点 %zu，真名 %llu，未定名 %llu，未压总字节 %llu（名字表 %zu 条）\n",
+                pkgDir.filename().string().c_str(), nodes.size(),
+                static_cast<unsigned long long>(st.named),
+                static_cast<unsigned long long>(st.nameless),
+                static_cast<unsigned long long>(st.bytes), table.size());
+    qtsvfs::TreeStats walked;
+    qtsvfs::printTree(root, stdout, 0, depthLimit, walked);
+    std::printf("  → 打印目录 %llu，文件 %llu（含未定名 %llu）\n",
+                static_cast<unsigned long long>(walked.dirs),
+                static_cast<unsigned long long>(walked.files),
+                static_cast<unsigned long long>(walked.nameless));
+    if (!outTsv.empty()) {
+        std::vector<qtsvfs::TreeRow> rows;
+        qtsvfs::collectRows(root, rows, 0, depthLimit);
+        std::ofstream os(utf8ToPath(outTsv), std::ios::binary | std::ios::trunc);
+        os << "path\thash\tsize\tmethod\tsource\n";
+        for (const auto& r : rows) {
+            char hex[24];
+            std::snprintf(hex, sizeof(hex), "%016llX", static_cast<unsigned long long>(r.hash));
+            os << r.path << '\t' << hex << '\t' << r.size << '\t' << unsigned(r.method) << '\t'
+               << (r.named ? "name" : "hash") << '\n';
         }
+        std::printf("  → 文件树清单 %zu 行: %s\n", rows.size(), outTsv.c_str());
     }
-    std::printf("包 %s：节点 %zu，名字表命中 %llu，未定名 %llu（名字表共 %zu 条）\n",
-                pkgDir.filename().string().c_str(), pkg.nodes().size(),
-                static_cast<unsigned long long>(named),
-                static_cast<unsigned long long>(pkg.nodes().size() - named), table.size());
-    std::uint64_t files = 0, dirs = 0, nameless = 0;
-    printLayout(root, 0, files, dirs, nameless, depthLimit);
-    std::printf("  → 目录 %llu，文件 %llu，其中未定名 %llu\n",
-                static_cast<unsigned long long>(dirs), static_cast<unsigned long long>(files),
-                static_cast<unsigned long long>(nameless));
     return 0;
-}
-
-// 名单里的路径来自包内明文，可能带 ".."、保留字符或超长段；导出前一律规整，
-// 保证落在 outDir 之内且 Windows 可用。
-std::string safeRelative(const std::string& path) {
-    std::string res;
-    std::size_t i = 0;
-    while (i < path.size()) {
-        while (i < path.size() && (path[i] == '/' || path[i] == '\\')) {
-            ++i;
-        }
-        std::size_t j = i;
-        while (j < path.size() && path[j] != '/' && path[j] != '\\') {
-            ++j;
-        }
-        std::string seg = path.substr(i, j - i);
-        i = j;
-        if (seg.empty() || seg == "." || seg == "..") {
-            continue;
-        }
-        for (char& c : seg) {
-            if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|' ||
-                c < 32) {
-                c = '_';
-            }
-        }
-        if (seg.size() > 96) {
-            seg = seg.substr(0, 96);
-        }
-        if (!res.empty()) {
-            res += '/';
-        }
-        res += seg;
-    }
-    return res;
 }
 
 int cmdExport(const std::filesystem::path& pkgDir, const std::string& namesFile,
               const std::string& outDir, std::uint64_t limit) {
-    std::unordered_map<std::uint64_t, std::string> table;
-    if (!loadNameTable(namesFile, table)) {
-        std::fprintf(stderr, "名字表为空或读不到: %s\n", namesFile.c_str());
+    qtsvfs::NameTable table;
+    std::string err;
+    if (!qtsvfs::loadNameTable(utf8ToPath(namesFile), table, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
     }
     qtsvfs::Package pkg;
-    std::string err;
-    if (!pkg.open(pkgDir, err)) {
-        std::fprintf(stderr, "打开包失败: %s\n", err.c_str());
+    if (!pkg.open(pkgDir, err) || !pkg.loadNodes(err)) {
+        std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
         return 2;
     }
-    if (!pkg.loadNodes(err)) {
-        std::fprintf(stderr, "无 FileNode: %s\n", err.c_str());
-        return 2;
-    }
-    const std::filesystem::path base = utf8ToPath(outDir);
-    std::vector<std::pair<std::uint64_t, std::string>> jobs;
-    for (const auto& [h, node] : pkg.nodes()) {
-        (void)node;
-        const auto it = table.find(h);
-        if (it != table.end()) {
-            jobs.emplace_back(h, it->second);
-        }
-    }
-    std::sort(jobs.begin(), jobs.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     std::printf("包 %s：%zu 节点，其中定名 %zu，导出到 %s\n", pkgDir.filename().string().c_str(),
-                pkg.nodes().size(), jobs.size(), outDir.c_str());
-    std::unordered_set<std::string> used;
-    std::uint64_t done = 0, bytes = 0, fail = 0, dup = 0;
-    for (const auto& [h, path] : jobs) {
-        if (done >= limit) {
-            std::printf("  达到 --limit=%llu，提前结束\n", static_cast<unsigned long long>(limit));
-            break;
-        }
-        std::string rel = safeRelative(path);
-        if (rel.empty()) {
-            rel = toHexU64(h);
-        }
-        if (!used.insert(rel).second) {
-            rel += "#" + toHexU64(h).substr(8, 8);  // 规整后重名：加哈希尾巴，不覆盖已导出的
-            ++dup;
-        }
-        const auto itNode = pkg.nodes().find(h);
-        std::vector<std::uint8_t> blob;
-        std::string e2;
-        if (itNode == pkg.nodes().end() || !pkg.readBlob(itNode->second, blob, e2)) {
-            ++fail;
-            continue;
-        }
-        const std::filesystem::path dst = base / utf8ToPath(rel);
-        std::error_code ec;
-        std::filesystem::create_directories(dst.parent_path(), ec);
-        std::ofstream os(dst, std::ios::binary | std::ios::trunc);
-        if (!os) {
-            ++fail;
-            std::fprintf(stderr, "  写入失败: %s\n", rel.c_str());
-            continue;
-        }
-        os.write(reinterpret_cast<const char*>(blob.data()),
-                 static_cast<std::streamsize>(blob.size()));
-        ++done;
-        bytes += blob.size();
-        if (done % 200 == 0) {
-            std::printf("  … 已导出 %llu 个 (%llu MB)\n", static_cast<unsigned long long>(done),
-                        static_cast<unsigned long long>(bytes >> 20));
-            std::fflush(stdout);
-        }
-    }
-    std::printf("  → 导出 %llu 个文件共 %llu 字节，解包失败 %llu，重名改名 %llu\n",
-                static_cast<unsigned long long>(done), static_cast<unsigned long long>(bytes),
-                static_cast<unsigned long long>(fail), static_cast<unsigned long long>(dup));
-    return 0;
+                pkg.nodes().size(), table.size(), outDir.c_str());
+    const qtsvfs::ExportResult r =
+        qtsvfs::exportPackage(pkg, table, utf8ToPath(outDir), limit, nullptr,
+                              [](const qtsvfs::ExportResult& cur) {
+                                  if (cur.files % 500 == 0) {
+                                      std::printf("  … 已导出 %llu 个 (%llu MB)\n",
+                                                  static_cast<unsigned long long>(cur.files),
+                                                  static_cast<unsigned long long>(cur.bytes >> 20));
+                                      std::fflush(stdout);
+                                  }
+                              });
+    std::printf("  → 导出 %llu 个文件共 %llu 字节，失败 %llu，改名 %llu，无名跳过 %llu%s\n",
+                static_cast<unsigned long long>(r.files),
+                static_cast<unsigned long long>(r.bytes),
+                static_cast<unsigned long long>(r.failed),
+                static_cast<unsigned long long>(r.renamed),
+                static_cast<unsigned long long>(r.skipped),
+                r.cancelled ? "  [已取消]" : "");
+    return r.error.empty() ? 0 : 3;
 }
+
 
 bool loadKeyset(const std::string& file, std::unordered_set<std::uint64_t>& out) {
     std::ifstream in(file);
@@ -1556,10 +1394,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "layout 需要包目录参数，如 packages/101\n");
             return 1;
         }
-        std::string names;
+        std::string names, outTsv;
         for (const auto& t : rest) {
             if (t.rfind("--names=", 0) == 0) {
                 names = t.substr(8);
+            } else if (t.rfind("--out=", 0) == 0) {
+                outTsv = t.substr(6);
             }
         }
         if (names.empty()) {
@@ -1568,7 +1408,7 @@ int main(int argc, char** argv) {
         }
         std::uint64_t depth = 3;
         optValue("--depth", depth, 3);
-        return cmdLayout(files[0], names, depth);
+        return cmdLayout(files[0], names, depth, outTsv);
     }
     if (sub == "scan") {
         auto files = positional({});
