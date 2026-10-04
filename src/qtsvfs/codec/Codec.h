@@ -6,21 +6,21 @@
 
 namespace qtsvfs {
 
-// 页解压分派：libQtsVFS.so 里 DecompressPage 用 (&PTR_FUN_004bd880)[flag & 0xff] 取函数，
-// 表体在 .bss 由运行期填充，转储里没有写点；编号顺序按压缩侧表 PTR_FUN_004bd668
-// （DecompressFunc_LZ4 / LZ4HC / OODLE / LZ3 / ZSTD）对齐，并用包 0 的两个
-// node-index 样本实测校验（见 codec/Codec.cpp 的注释）。
+// 页解压分派（libQtsVFS.so.c 实测语义，非猜测）：
+//   DecompressPage 用 (&PTR_FUN_004bd880)[param_6 & 0xff] 取函数，param_6 是 FileNode
+//   块描述符里的 packed；ctx = (packed>>8)&0xff 决定是否跨页续流。
+//   QtsfTool::DecompressBuffer 明示：method 2/3/4/5 → OodleLZ_Decompress，
+//   method 1 → LZ4_decompress_fast，index 0 → 裸拷贝。
 enum : std::uint8_t {
-    kMethodLz4 = 0,
-    kMethodLz4Hc = 1,
-    kMethodOodle = 2,
-    kMethodLz3 = 3,
-    kMethodZstd = 4,
+    kMethodRaw = 0,
+    kMethodLz4 = 1,
+    kMethodOodleMin = 2,
+    kMethodOodleMax = 5,
 };
 
 const char* methodName(std::uint8_t id);
 
-// 解压到 dst（容量 dstCapacity）；返回实际字节数，失败返回 0 并写 err。
+// src/srcLen 是去掉页头 u32 之后的压缩流，dstCapacity 用页头声明的未压缩长度。
 std::size_t decompressByMethod(std::uint8_t id, const std::uint8_t* src, std::size_t srcLen,
                                std::uint8_t* dst, std::size_t dstCapacity, std::string& err);
 
