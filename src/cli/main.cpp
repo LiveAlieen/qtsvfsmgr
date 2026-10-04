@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <initializer_list>
 #include <string>
 #include <unordered_map>
@@ -276,7 +278,8 @@ void printNode(const qtsvfs::QtsfNode& node, int depth, std::uint64_t& files,
     }
 }
 
-int cmdTree(const std::filesystem::path& pkgDir, std::uint64_t depthLimit) {
+int cmdTree(const std::filesystem::path& pkgDir, std::uint64_t depthLimit,
+            const std::string& outNames) {
     qtsvfs::Package pkg;
     std::string err;
     if (!pkg.open(pkgDir, err)) {
@@ -314,6 +317,17 @@ int cmdTree(const std::filesystem::path& pkgDir, std::uint64_t depthLimit) {
         printNode(root, 0, files, dirs, depthLimit);
         std::printf("  → 目录 %llu，文件 %llu\n", static_cast<unsigned long long>(dirs),
                     static_cast<unsigned long long>(files));
+        if (!outNames.empty()) {
+            std::vector<std::pair<std::uint64_t, std::string>> table;
+            table.reserve(files + 1);
+            qtsvfs::collectHashPaths(root, "", table);
+            std::ofstream os(outNames, std::ios::binary | std::ios::trunc);
+            for (const auto& [h, path] : table) {
+                os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h
+                   << '\t' << path << '\n';
+            }
+            std::printf("  → 已写出 hash→path 共 %zu 行: %s\n", table.size(), outNames.c_str());
+        }
     }
     return 0;
 }
@@ -475,9 +489,18 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "tree 需要包目录参数，如 packages/0\n");
             return 1;
         }
-        std::uint64_t depth = 2;
-        optValue("--depth", depth, 2);
-        return cmdTree(files[0], depth);
+        std::uint64_t depth = 3;
+        optValue("--depth", depth, 3);
+        std::string outNames;
+        for (const auto& t : rest) {
+            if (t.rfind("--out", 0) == 0) {
+                const std::size_t eq = t.find('=');
+                if (eq != std::string::npos) {
+                    outNames = t.substr(eq + 1);
+                }
+            }
+        }
+        return cmdTree(files[0], depth, outNames);
     }
     if (sub == "nodes") {
         const auto files = positional({});

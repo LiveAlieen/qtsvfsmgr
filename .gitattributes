@@ -1,0 +1,9 @@
+* text=auto eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.bat text eol=crlf
+*.tsv -text
