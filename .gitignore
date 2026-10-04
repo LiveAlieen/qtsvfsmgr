@@ -1,0 +1,9 @@
+build/
+out/
+scratch/
+.cache/
+.vs/
+*.user
+CMakeUserPresets.json
+__pycache__/
+*.pyc
