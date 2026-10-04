@@ -3,6 +3,8 @@ add_library(qtsvfs_core STATIC
     qtsvfs/probe/Probe.cpp
     qtsvfs/format/Kdb.cpp
     qtsvfs/format/PathHash.cpp
+    qtsvfs/format/QtsfNode.cpp
+    qtsvfs/format/QtsfStream.cpp
 )
 target_include_directories(qtsvfs_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(qtsvfs_core PUBLIC

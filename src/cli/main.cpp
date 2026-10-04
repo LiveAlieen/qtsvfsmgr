@@ -15,6 +15,7 @@
 #endif
 
 #include "qtsvfs/format/Kdb.h"
+#include "qtsvfs/format/QtsfNode.h"
 #include "qtsvfs/format/PathHash.h"
 #include "qtsvfs/io/FileReader.h"
 #include "qtsvfs/probe/Probe.h"
@@ -216,6 +217,40 @@ int cmdKdbRecords(const std::filesystem::path& p, std::uint64_t limit, bool hist
     return err.empty() ? 0 : 3;
 }
 
+int cmdNodes(const std::filesystem::path& p, std::uint64_t limit) {
+    qtsvfs::FileReader fr;
+    qtsvfs::KdbFile db;
+    std::string err;
+    if (!openKdb(p, fr, db, err)) {
+        std::fprintf(stderr, "错误: %s\n", err.c_str());
+        return 2;
+    }
+    std::uint64_t shown = 0, parsed = 0, other = 0;
+    db.forEachRecord(
+        [&](const qtsvfs::KdbRecord& r) {
+            qtsvfs::FileNode node;
+            if (!node.parse(r.value.data(), r.value.size())) {
+                ++other;
+                return true;
+            }
+            ++parsed;
+            if (shown < limit) {
+                std::printf("%016llX size=%-10llu ver=0x%08X blocks=%u", static_cast<unsigned long long>(node.hash),
+                            static_cast<unsigned long long>(node.size), node.version, node.blockCount);
+                for (const auto& b : node.blocks) {
+                    std::printf(" {start=0x%X packed=0x%08X blk=0x%X}", b.startPos, b.packed, b.blockSize);
+                }
+                std::printf("\n");
+                ++shown;
+            }
+            return true;
+        },
+        err);
+    std::printf("\nFileNode 解析成功 %llu，非节点记录 %llu%s\n", static_cast<unsigned long long>(parsed),
+                static_cast<unsigned long long>(other), err.empty() ? "" : ("  遍历警告: " + err));
+    return 0;
+}
+
 int cmdProbe(const std::filesystem::path& file, std::uint64_t head_bytes, std::uint64_t sample_bytes,
              std::uint64_t block_bytes) {
     qtsvfs::FileReader fr;
@@ -272,6 +307,7 @@ void usage() {
         "  qtsvfs hash <path>...                  计算节点哈希 (VFS_CalcHashCode64Raw)\n"
         "  qtsvfs kdb info <file.db>              外层 QtskDB 头\n"
         "  qtsvfs kdb records <file.db> [--max=N] [--hist]   枚举 B+树记录\n"
+        "  qtsvfs nodes <file.db> [--max=N]          解码 FileNode 与块表\n"
         "  qtsvfs probe <file> [--head=N] [--sample=N] [--block=N]\n"
         "\n"
         "尺寸选项支持 K/M/G 后缀。\n");
@@ -364,6 +400,16 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "未知 kdb 子命令: %s\n", mode.c_str());
         return 1;
+    }
+    if (sub == "nodes") {
+        const auto files = positional({});
+        if (files.empty()) {
+            std::fprintf(stderr, "nodes 需要一个 .db 文件参数\n");
+            return 1;
+        }
+        std::uint64_t max = 20;
+        optValue("--max", max, 20);
+        return cmdNodes(files[0], max);
     }
     if (sub == "probe") {
         std::uint64_t head = 0x100, sample = 16ull * 1024 * 1024, block = 64ull * 1024;
