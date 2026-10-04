@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <iomanip>
 #include <initializer_list>
 #include <string>
@@ -16,6 +17,7 @@
 #include <windows.h>
 #endif
 
+#include "qtsvfs/codec/Codec.h"
 #include "qtsvfs/format/GlobalIndex.h"
 #include "qtsvfs/format/Kdb.h"
 #include "qtsvfs/format/QtsfNode.h"
@@ -333,6 +335,68 @@ int cmdTree(const std::filesystem::path& pkgDir, std::uint64_t depthLimit,
     return 0;
 }
 
+// 在解压后的明文里找自声明路径标记，并用节点哈希自校验。
+void reportSelfDeclared(const std::vector<std::uint8_t>& blob, std::uint64_t nodeHash,
+                        const char* tag) {
+    static const std::regex marker(
+        "([A-Za-z]*Path:)([ -~]{4,200}?(\\.mjs|\\.lua|\\.json|\\.txt|\\.js))");
+    const std::string text(reinterpret_cast<const char*>(blob.data()), blob.size());
+    std::smatch m;
+    auto head = text.begin();
+    int shown = 0;
+    while (std::regex_search(head, text.end(), m, marker) && shown < 6) {
+        const std::string path = m[2].str();
+        const std::uint64_t h = qtsvfs::calcHashCode64(path);
+        const bool ok = h == nodeHash || qtsvfs::calcHashCode64("/" + path) == nodeHash;
+        std::printf("  %s 自声明: %s%s -> %s\n", tag, m[1].str().c_str(), path.c_str(),
+                    ok ? "哈希自校验通过" : "不匹配");
+        ++shown;
+        head = m.suffix().first;
+    }
+    if (shown == 0) {
+        std::printf("  %s 未发现自声明标记\n", tag);
+    }
+}
+
+int cmdExtract(const std::filesystem::path& pkgDir, const std::string& hashHex,
+               const std::string& outPath) {
+    qtsvfs::Package pkg;
+    std::string err;
+    if (!pkg.open(pkgDir, err)) {
+        std::fprintf(stderr, "打开包失败: %s\n", err.c_str());
+        return 2;
+    }
+    if (!pkg.loadNodes(err)) {
+        std::fprintf(stderr, "无 FileNode: %s\n", err.c_str());
+        return 2;
+    }
+    const std::uint64_t hash = std::strtoull(hashHex.c_str(), nullptr, 16);
+    const auto it = pkg.nodes().find(hash);
+    if (it == pkg.nodes().end()) {
+        std::fprintf(stderr, "包内无节点 %s\n", hashHex.c_str());
+        return 3;
+    }
+    const qtsvfs::FileNode& node = it->second;
+    std::printf("节点 %s 未压缩=%llu 块数=%u method=%s\n", hashHex.c_str(),
+                static_cast<unsigned long long>(node.size), node.blockCount,
+                node.blocks.empty() ? "-" : qtsvfs::methodName(static_cast<std::uint8_t>(node.blocks[0].packed & 0xFF)));
+    std::vector<std::uint8_t> blob;
+    if (!pkg.readBlob(node, blob, err)) {
+        std::fprintf(stderr, "读取失败: %s\n", err.c_str());
+        return 4;
+    }
+    std::printf("  解出 %zu 字节", blob.size());
+    if (!outPath.empty()) {
+        std::ofstream os(outPath, std::ios::binary);
+        os.write(reinterpret_cast<const char*>(blob.data()),
+                 static_cast<std::streamsize>(blob.size()));
+        std::printf(" -> %s", outPath.c_str());
+    }
+    std::printf("\n");
+    reportSelfDeclared(blob, hash, "  ");
+    return 0;
+}
+
 int cmdGindex(const std::filesystem::path& dataFile, const std::string& namesFile) {
     qtsvfs::GlobalIndex gi;
     std::string err;
@@ -555,6 +619,26 @@ int main(int argc, char** argv) {
             }
         }
         return cmdTree(files[0], depth, outNames);
+    }
+    if (sub == "extract") {
+        const auto files = positional({});
+        if (files.size() < 2) {
+            std::fprintf(stderr, "extract 需要 <packageDir> <hashHex> [--out=文件]\n");
+            return 1;
+        }
+        std::string outPath, hashHex;
+        for (const auto& t : rest) {
+            if (t.rfind("--out=", 0) == 0) {
+                outPath = t.substr(6);
+            } else if (t.size() == 16 && t.find_first_of("0123456789abcdefABCDEF") == 0) {
+                hashHex = t;
+            }
+        }
+        if (hashHex.empty()) {
+            std::fprintf(stderr, "缺少 16 位十六进制节点哈希\n");
+            return 1;
+        }
+        return cmdExtract(files[0], hashHex, outPath);
     }
     if (sub == "gindex") {
         const auto files = positional({});
