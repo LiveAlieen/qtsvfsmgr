@@ -158,8 +158,12 @@ bool Package::readBlob(const FileNode& node, std::vector<std::uint8_t>& out, std
         const std::uint8_t* src = rec.value.data() + 4;
         const std::size_t srcLen = rec.value.size() - 4;
         const std::size_t cap = ref.declaredSize ? ref.declaredSize : srcLen * 8 + 1024;
+        // ooz 的末尾 quantum 会按字长多写几十字节（实测包 116 的 872 字节块踩坏堆），
+        // 所以物理缓冲留 SAFE_SPACE，但传给解码器的容量仍是页里声明的长度，
+        // LZ4_decompress_fast 依赖这个长度决定停止位置，不能放大。
+        constexpr std::size_t kSlack = 64;
         const std::size_t at = out.size();
-        out.resize(at + cap);
+        out.resize(at + cap + kSlack);
         std::string decErr;
         const std::size_t n = decompressByMethod(method, src, srcLen, out.data() + at, cap, decErr);
         if (n == 0) {
@@ -168,7 +172,7 @@ bool Package::readBlob(const FileNode& node, std::vector<std::uint8_t>& out, std
             out.resize(at);
             return false;
         }
-        out.resize(at + n);
+        out.resize(at + std::min(n, cap));
     }
     return true;
 }

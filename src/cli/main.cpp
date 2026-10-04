@@ -11,6 +11,7 @@
 #include <initializer_list>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef _WIN32
@@ -223,6 +224,49 @@ int cmdKdbRecords(const std::filesystem::path& p, std::uint64_t limit, bool hist
     return err.empty() ? 0 : 3;
 }
 
+// raw: 按 key（u64 十六进制）或记录偏移取出元数据卷里的原始记录值，用于读特殊流节点。
+int cmdRaw(const std::filesystem::path& p, const std::string& keyHex, std::uint64_t off,
+           bool hasOff, const std::string& outPath, std::uint64_t headBytes) {
+    qtsvfs::FileReader fr;
+    qtsvfs::KdbFile db;
+    std::string err;
+    if (!openKdb(p, fr, db, err)) {
+        std::fprintf(stderr, "错误: %s\n", err.c_str());
+        return 2;
+    }
+    const std::uint64_t want = keyHex.empty() ? 0 : std::strtoull(keyHex.c_str(), nullptr, 16);
+    int found = 0;
+    db.forEachRecord(
+        [&](const qtsvfs::KdbRecord& r) {
+            const std::uint64_t k =
+                r.key.size() >= 8 ? le32At(r.key, 0) | (static_cast<std::uint64_t>(le32At(r.key, 4)) << 32) : 0;
+            const bool match = (!keyHex.empty() && k == want) || (hasOff && r.offset == off);
+            if (!match) {
+                return true;
+            }
+            ++found;
+            std::printf("@0x%08X key=%016llX h2=%s keylen=%u vallen=%u\n", r.offset,
+                        static_cast<unsigned long long>(k), toHexU32(r.hash2).c_str(), r.keyLen,
+                        r.valueLen);
+            std::fputs(qtsvfs::hexdump(r.value.data(), std::min<std::size_t>(r.value.size(), headBytes), 0)
+                           .c_str(),
+                       stdout);
+            if (!outPath.empty()) {
+                std::ofstream os(outPath, std::ios::binary | std::ios::trunc);
+                os.write(reinterpret_cast<const char*>(r.value.data()),
+                         static_cast<std::streamsize>(r.value.size()));
+                std::printf("  -> 写出 %zu 字节: %s\n", r.value.size(), outPath.c_str());
+            }
+            return true;
+        },
+        err);
+    if (!found) {
+        std::fprintf(stderr, "未找到匹配记录\n");
+        return 3;
+    }
+    return 0;
+}
+
 int cmdNodes(const std::filesystem::path& p, std::uint64_t limit) {
     qtsvfs::FileReader fr;
     qtsvfs::KdbFile db;
@@ -397,6 +441,235 @@ int cmdExtract(const std::filesystem::path& pkgDir, const std::string& hashHex,
     return 0;
 }
 
+// 批量解块并在明文里找自声明标记：标记串只有 hash(形式)==本节点哈希 才算「自声明」，
+// 命中包内其他节点算「引用」，其余算未验证（可能是包内相对路径，缺挂载前缀）。
+struct ScanStats {
+    std::uint64_t nodes = 0, decoded = 0, failed = 0, skipped = 0;
+    std::uint64_t withMarker = 0, candidates = 0, selfHit = 0, refHit = 0, loHit = 0, unverified = 0;
+    std::uint64_t sizeMismatch = 0;
+    std::uint64_t ratio[5] = {0, 0, 0, 0, 0};  // <0.5 0.5-0.7 0.7-0.85 0.85-0.95 >0.95
+};
+
+double printableRatio(const std::vector<std::uint8_t>& b) {
+    if (b.empty()) {
+        return 0.0;
+    }
+    const std::size_t n = std::min<std::size_t>(b.size(), 64 * 1024);
+    std::size_t ok = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::uint8_t c = b[i];
+        if ((c >= 0x20 && c <= 0x7e) || c == '\t' || c == '\n' || c == '\r') ok++;
+    }
+    return static_cast<double>(ok) / static_cast<double>(n);
+}
+
+// 通用标记键：2..24 个「词字符」+ 词干（如 Path）+ : 或 = ，用于统计有哪些自声明格式。
+bool markerKeyAt(const std::string& t, std::size_t pos, std::size_t& keyStart, std::size_t& keyEnd) {
+    std::size_t i = 0;
+    while (i < pos && i < 24) {
+        const char c = t[pos - i - 1];
+        const bool keep = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                          c == '_' || c == '-';
+        if (!keep) break;
+        ++i;
+    }
+    if (i < 1) {
+        return false;
+    }
+    keyStart = pos - i;
+    keyEnd = pos;
+    return true;
+}
+
+int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::uint64_t maxNodeSize,
+            const std::string& outTsv, bool append, bool showAll, bool trace) {
+    qtsvfs::Package pkg;
+    std::string err;
+    if (!pkg.open(pkgDir, err)) {
+        std::fprintf(stderr, "打开包失败: %s\n", err.c_str());
+        return 2;
+    }
+    if (!pkg.loadNodes(err)) {
+        std::fprintf(stderr, "无 FileNode: %s\n", err.c_str());
+        return 2;
+    }
+    std::vector<const qtsvfs::FileNode*> list;
+    list.reserve(pkg.nodes().size());
+    for (const auto& [h, n] : pkg.nodes()) {
+        (void)h;
+        list.push_back(&n);
+    }
+    std::sort(list.begin(), list.end(), [](const auto* a, const auto* b) {
+        if (a->size != b->size) return a->size < b->size;
+        return a->hash < b->hash;
+    });
+
+    std::unordered_map<std::string, std::uint64_t> keyFreq;
+    std::unordered_map<std::string, std::string> keyExample;
+    std::unordered_map<std::string, std::uint64_t> failReason;
+    ScanStats st;
+    std::ofstream os;
+    if (!outTsv.empty()) {
+        os.open(outTsv, std::ios::binary | (append ? std::ios::app : std::ios::trunc));
+    }
+
+    // 手写 token 扫描：regex 的嵌套量词在长文本上会回溯爆栈。
+    auto isPathChar = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_' || c == '-' || c == '.' || c == '/' || c == '+';
+    };
+
+    for (std::size_t idx = 0; idx < list.size() && st.nodes < maxNodes; ++idx) {
+        const qtsvfs::FileNode* node = list[idx];
+        ++st.nodes;
+        if (node->size > maxNodeSize) {
+            ++st.skipped;
+            continue;
+        }
+        std::vector<std::uint8_t> blob;
+        std::string de;
+        if (trace) {
+            std::fprintf(stderr, "trace %016llX size=%llu blocks=%u method=%u\n",
+                         static_cast<unsigned long long>(node->hash),
+                         static_cast<unsigned long long>(node->size), node->blockCount,
+                         node->blocks.empty() ? 0u
+                             : static_cast<unsigned>(node->blocks[0].packed & 0xFFu));
+        }
+        try {
+            if (!pkg.readBlob(*node, blob, de)) {
+                ++st.failed;
+                failReason[de.substr(0, 72)]++;
+                continue;
+            }
+        } catch (const std::exception& e) {
+            ++st.failed;
+            failReason[std::string("exception: ") + e.what()]++;
+            continue;
+        }
+        ++st.decoded;
+        if (blob.size() != node->size) {
+            ++st.sizeMismatch;
+        }
+        const double r = printableRatio(blob);
+        st.ratio[r < 0.5 ? 0 : r < 0.7 ? 1 : r < 0.85 ? 2 : r < 0.95 ? 3 : 4]++;
+        // 标记可能藏在二进制包装的明文段里，因此不按可打印率设门槛。
+        const std::string text(reinterpret_cast<const char*>(blob.data()), blob.size());
+        const std::size_t scanLimit = std::min<std::size_t>(text.size(), 4u << 20);
+        bool nodeHasMarker = false;
+        std::unordered_set<std::string> seen;
+        // 通用发现模式：任意 「键: 路径」/「键=路径」 都算候选，用来看还有哪些自声明格式。
+        for (std::size_t sep = text.find(':', 0); sep != std::string::npos && sep < scanLimit;
+             sep = text.find(':', sep + 1)) {
+            std::size_t ks = 0, ke = 0;
+            if (!markerKeyAt(text, sep, ks, ke)) {
+                continue;
+            }
+            const std::size_t s = sep + 1;
+            std::size_t e = s;
+            while (e < text.size() && isPathChar(text[e]) && e - s < 300) {
+                ++e;
+            }
+            const std::string tok = text.substr(s, e - s);
+            if (tok.size() < 6 || tok.find('/') == std::string::npos ||
+                !std::isalnum(static_cast<unsigned char>(tok.back()))) {
+                continue;
+            }
+            const std::string key = text.substr(ks, ke - ks) + ":";
+            nodeHasMarker = true;
+            if (!seen.insert(key + "\x01" + tok).second) {
+                continue;
+            }
+            ++st.candidates;
+            keyFreq[key]++;
+            keyExample.try_emplace(key, tok);
+            int hit = 0;  // 1=本节点自声明 2=指向包内其他节点 3=低32位命中(全局索引 fileHash)
+            for (int form = 0; form < 2; ++form) {
+                const std::string base = form ? "/" + tok : tok;
+                for (int lower = 0; lower < 2; ++lower) {
+                    std::string sl = base;
+                    if (lower) {
+                        std::transform(sl.begin(), sl.end(), sl.begin(), [](unsigned char c) {
+                            return static_cast<char>(std::tolower(c));
+                        });
+                    }
+                    const std::uint64_t h = qtsvfs::calcHashCode64(sl);
+                    if (h == node->hash) {
+                        hit = 1;
+                    } else if (hit != 1 && pkg.nodes().count(h)) {
+                        hit = 2;
+                    } else if (hit == 0 && (h & 0xFFFFFFFFu) == (node->hash & 0xFFFFFFFFu)) {
+                        hit = 3;
+                    }
+                }
+            }
+            if (hit == 1) ++st.selfHit;
+            else if (hit == 2) ++st.refHit;
+            else if (hit == 3) ++st.loHit;
+            else ++st.unverified;
+            if (os && (hit || showAll)) {
+                os << std::hex << std::uppercase << std::setw(16) << std::setfill('0')
+                   << node->hash << (hit == 1 ? "\tself\t" : hit == 2   ? "\tref\t"
+                                              : hit == 3 ? "\tlo32\t"   : "\t-\t")
+                   << key << '\t' << tok << '\n' << std::dec;
+            }
+        }
+        if (nodeHasMarker) {
+            ++st.withMarker;
+        }
+        if (st.nodes % 1000 == 0) {
+            std::printf("  … 已扫 %llu 节点，含标记节点 %llu，自声明 %llu，引用 %llu\n",
+                        static_cast<unsigned long long>(st.nodes),
+                        static_cast<unsigned long long>(st.withMarker),
+                        static_cast<unsigned long long>(st.selfHit),
+                        static_cast<unsigned long long>(st.refHit));
+            std::fflush(stdout);
+        }
+    }
+    std::printf("包 %s: 节点扫描=%llu 解压失败=%llu 超限跳过=%llu 含标记节点=%llu 标记串=%llu\n",
+                pkgDir.filename().string().c_str(), static_cast<unsigned long long>(st.nodes),
+                static_cast<unsigned long long>(st.failed),
+                static_cast<unsigned long long>(st.skipped),
+                static_cast<unsigned long long>(st.withMarker),
+                static_cast<unsigned long long>(st.candidates));
+    std::printf("  哈希自校验: 本节点自声明=%llu 指向包内其他节点=%llu 低32位命中=%llu 无匹配=%llu\n",
+                static_cast<unsigned long long>(st.selfHit),
+                static_cast<unsigned long long>(st.refHit),
+                static_cast<unsigned long long>(st.loHit),
+                static_cast<unsigned long long>(st.unverified));
+    std::printf("  可打印率分布 <0.5/0.5-0.7/0.7-0.85/0.85-0.95/>0.95 = %llu/%llu/%llu/%llu/%llu，"
+                "解出长度与声明不符=%llu\n",
+                static_cast<unsigned long long>(st.ratio[0]),
+                static_cast<unsigned long long>(st.ratio[1]),
+                static_cast<unsigned long long>(st.ratio[2]),
+                static_cast<unsigned long long>(st.ratio[3]),
+                static_cast<unsigned long long>(st.ratio[4]),
+                static_cast<unsigned long long>(st.sizeMismatch));
+    std::vector<std::pair<std::string, std::uint64_t>> fails(failReason.begin(), failReason.end());
+    std::sort(fails.begin(), fails.end(), [](const auto& a, const auto& b) {
+        return a.second > b.second;
+    });
+    for (std::size_t i = 0; i < fails.size() && i < 6; ++i) {
+        std::printf("    失败 x%llu: %s\n", static_cast<unsigned long long>(fails[i].second),
+                    fails[i].first.c_str());
+    }
+    std::vector<std::pair<std::string, std::uint64_t>> keys(keyFreq.begin(), keyFreq.end());
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+    });
+    std::printf("  声明键 Top15（次数 | 例子）:\n");
+    for (std::size_t i = 0; i < keys.size() && i < 15; ++i) {
+        std::printf("    %-22s %-7llu %s\n", keys[i].first.c_str(),
+                    static_cast<unsigned long long>(keys[i].second),
+                    keyExample.count(keys[i].first) ? keyExample[keys[i].first].substr(0, 72).c_str()
+                                                    : "");
+    }
+    if (os) {
+        std::printf("  → 命中清单: %s\n", outTsv.c_str());
+    }
+    return 0;
+}
+
 int cmdGindex(const std::filesystem::path& dataFile, const std::string& namesFile) {
     qtsvfs::GlobalIndex gi;
     std::string err;
@@ -508,6 +781,8 @@ void usage() {
         "  qtsvfs gindex <GlobalIndex.data> [--names=tsv]\n"
         "  qtsvfs tree <packageDir> [--depth=N]      用官方 node-index 还原真实文件树\n"
         "  qtsvfs nodes <file.db> [--max=N]          解码 FileNode 与块表\n"
+        "  qtsvfs scan <packageDir>... [--max=N] [--maxsize=N] [--out=tsv]\n"
+        "                                      批量解块并哈希自校验包内自声明路径\n"
         "  qtsvfs probe <file> [--head=N] [--sample=N] [--block=N]\n"
         "\n"
         "尺寸选项支持 K/M/G 后缀。\n");
@@ -640,6 +915,35 @@ int main(int argc, char** argv) {
         }
         return cmdExtract(files[0], hashHex, outPath);
     }
+    if (sub == "scan") {
+        const auto files = positional({});
+        if (files.empty()) {
+            std::fprintf(stderr, "scan 需要包目录参数，如 packages/7\n");
+            return 1;
+        }
+        std::uint64_t max = 300, maxsize = 64ull * 1024 * 1024;
+        if (!optValue("--max", max, 300) || !optValue("--maxsize", maxsize, 64ull * 1024 * 1024)) {
+            std::fprintf(stderr, "选项解析失败\n");
+            return 1;
+        }
+        std::string outTsv;
+        bool showAll = false, trace = false;
+        for (const auto& t : rest) {
+            if (t.rfind("--out=", 0) == 0) {
+                outTsv = t.substr(6);
+            } else if (t == "--all") {
+                showAll = true;
+            } else if (t == "--trace") {
+                trace = true;
+            }
+        }
+        for (std::size_t i = 0; i < files.size(); ++i) {
+            if (cmdScan(files[i], max, maxsize, outTsv, i > 0, showAll, trace) != 0) {
+                return 2;
+            }
+        }
+        return 0;
+    }
     if (sub == "gindex") {
         const auto files = positional({});
         if (files.empty()) {
@@ -653,6 +957,33 @@ int main(int argc, char** argv) {
             }
         }
         return cmdGindex(files[0], names);
+    }
+    if (sub == "raw") {
+        const auto files = positional({});
+        if (files.empty()) {
+            std::fprintf(stderr, "raw 需要一个 .db 文件参数\n");
+            return 1;
+        }
+        std::string keyHex, outPath;
+        std::uint64_t off = 0, head = 0x100;
+        bool hasOff = false;
+        for (const auto& t : rest) {
+            if (t.rfind("--key=", 0) == 0) {
+                keyHex = t.substr(6);
+            } else if (t.rfind("--off=", 0) == 0) {
+                off = std::strtoull(t.c_str() + 6, nullptr, 0);
+                hasOff = true;
+            } else if (t.rfind("--out=", 0) == 0) {
+                outPath = t.substr(6);
+            } else if (t.rfind("--head=", 0) == 0) {
+                head = std::strtoull(t.c_str() + 7, nullptr, 0);
+            }
+        }
+        if (keyHex.empty() && !hasOff) {
+            std::fprintf(stderr, "raw 需要 --key=HEX16 或 --off=偏移\n");
+            return 1;
+        }
+        return cmdRaw(files[0], keyHex, off, hasOff, outPath, head);
     }
     if (sub == "nodes") {
         const auto files = positional({});
