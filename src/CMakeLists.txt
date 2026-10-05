@@ -9,6 +9,8 @@ add_library(qtsvfs_core STATIC
     qtsvfs/Package.cpp
     qtsvfs/Catalog.cpp
     qtsvfs/NodeTree.cpp
+    qtsvfs/Alias.cpp
+    qtsvfs/Normalize.cpp
     qtsvfs/Names.cpp
     qtsvfs/Tree.cpp
     qtsvfs/Export.cpp

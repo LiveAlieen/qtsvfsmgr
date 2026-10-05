@@ -22,6 +22,7 @@
 #endif
 
 #include "qtsvfs/codec/Codec.h"
+#include "qtsvfs/Alias.h"
 #include "qtsvfs/Catalog.h"
 #include "qtsvfs/Export.h"
 #include "qtsvfs/Names.h"
@@ -1237,43 +1238,107 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
     return 0;
 }
 
-int cmdExport(const std::filesystem::path& pkgDir, const std::string& namesFile,
-              const std::string& outDir, std::uint64_t limit, bool nameless) {
+int cmdExport(const std::vector<std::filesystem::path>& dirs, const std::string& namesFile,
+              const std::string& outDir, std::uint64_t limit, bool nameless, bool skipObsolete,
+              const std::string& manifest, const std::string& state, int threads,
+              bool normalize) {
     qtsvfs::NameTable table;
     std::string err;
-    if (!qtsvfs::loadNameTable(utf8ToPath(namesFile), table, err)) {
-        std::fprintf(stderr, "%s\n", err.c_str());
+    // --names 可以不给：全量解包喂 AssetRipper 时不需要我们的名字表（对象名它自己从 m_Name 取），
+    // 只要 --nameless 让每个节点都按哈希名落盘即可。
+    if (!namesFile.empty()) {
+        if (!qtsvfs::loadNameTable(utf8ToPath(namesFile), table, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str());
+            return 2;
+        }
+        qtsvfs::makeUnique(table);
+    } else if (!nameless) {
+        std::fprintf(stderr, "没给 --names 就必须 --nameless，否则没有任何节点会被导出\n");
         return 2;
     }
-    qtsvfs::makeUnique(table);
-    qtsvfs::Package pkg;
-    if (!pkg.open(pkgDir, err) || !pkg.loadNodes(err)) {
-        std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
-        return 2;
+    qtsvfs::ExportOptions opt;
+    opt.allowNameless = nameless;
+    opt.skipObsolete = skipObsolete;
+    opt.limit = limit;
+    opt.threads = threads;
+    opt.normalizeSerialized = normalize;
+    if (!manifest.empty()) {
+        opt.manifestPath = utf8ToPath(manifest);
     }
-    std::printf("包 %s：%zu 节点，名字表 %zu 条，导出到 %s\n", pkgDir.filename().string().c_str(),
-                pkg.nodes().size(), table.size(), outDir.c_str());
-    const qtsvfs::ExportResult r =
-        qtsvfs::exportPackage(pkg, table, utf8ToPath(outDir), limit, nullptr,
-                              [](const qtsvfs::ExportResult& cur) {
-                                  if (cur.files % 500 == 0) {
-                                      std::printf("  … 已导出 %llu 个 (%llu MB)\n",
-                                                  static_cast<unsigned long long>(cur.files),
-                                                  static_cast<unsigned long long>(cur.bytes >> 20));
-                                      std::fflush(stdout);
-                                  }
-                              },
-            nameless);
-    std::printf("  → 导出 %llu 个文件共 %llu 字节，失败 %llu，改名 %llu，无名跳过 %llu%s\n",
-                static_cast<unsigned long long>(r.files),
-                static_cast<unsigned long long>(r.bytes),
-                static_cast<unsigned long long>(r.failed),
-                static_cast<unsigned long long>(r.renamed),
-                static_cast<unsigned long long>(r.skipped),
-                r.cancelled ? "  [已取消]" : "");
-    return r.error.empty() ? 0 : 3;
+    if (!state.empty()) {
+        opt.statePath = utf8ToPath(state);
+    }
+    std::printf("%zu 个包目录（并行度 %d），名字表 %zu 条，导出到 %s（未定名%s，废弃节点%s，归一化%s，manifest=%s，state=%s）\n",
+                dirs.size(), threads, table.size(), outDir.c_str(), nameless ? "带哈希名落盘" : "跳过",
+                skipObsolete ? "跳过" : "照导", normalize ? "开" : "关",
+                manifest.empty() ? "无" : manifest.c_str(),
+                state.empty() ? "无（不续跑）" : state.c_str());
+    std::fflush(stdout);
+    std::atomic<int> seen{0};
+    const qtsvfs::ExportSummary r = qtsvfs::exportAll(
+        dirs, table, utf8ToPath(outDir), opt,
+        [&](const qtsvfs::ExportSummary& cur, const std::string& pkgName) {
+            std::printf("  [%d/%zu] %-24s 文件 %llu / %llu MB  无名 %llu 废弃 %llu 无块 %llu "
+                        "解败 %llu 截断 %llu\n",
+                        ++seen, cur.pending, pkgName.c_str(),
+                        static_cast<unsigned long long>(cur.files),
+                        static_cast<unsigned long long>(cur.bytes >> 20),
+                        static_cast<unsigned long long>(cur.noName),
+                        static_cast<unsigned long long>(cur.obsolete),
+                        static_cast<unsigned long long>(cur.noData),
+                        static_cast<unsigned long long>(cur.decodeFailed),
+                        static_cast<unsigned long long>(cur.shortBlob));
+            std::fflush(stdout);
+        });
+    std::printf(
+        "  → 导出 %llu 个文件共 %llu 字节（归一化 SerializedFile %llu 个）；跳过：未定名 %llu、废弃 %llu、"
+        "续跑已有 %zu 个包；异常：盘上无块 %llu、解压失败 %llu、长度不符 %llu、写盘失败 %llu、改名 %llu、"
+        "包打不开 %llu%s\n",
+        static_cast<unsigned long long>(r.files), static_cast<unsigned long long>(r.bytes),
+        static_cast<unsigned long long>(r.normalized),
+        static_cast<unsigned long long>(r.noName), static_cast<unsigned long long>(r.obsolete),
+        static_cast<size_t>(r.resumed), static_cast<unsigned long long>(r.noData),
+        static_cast<unsigned long long>(r.decodeFailed),
+        static_cast<unsigned long long>(r.shortBlob),
+        static_cast<unsigned long long>(r.writeFailed),
+        static_cast<unsigned long long>(r.renamed),
+        static_cast<unsigned long long>(r.dirsFailed), r.cancelled ? "  [已取消]" : "");
+    if (!r.error.empty()) {
+        std::printf("  最后一条错误: %s\n", r.error.c_str());
+    }
+    return r.error.empty() || r.files > 0 ? 0 : 3;
 }
 
+
+// SerializedFile 里 m_StreamData.path 写的是流节点的规范路径（assets/xx/<哈希>.resS），
+// 名字表给这些节点的多半是 catalog 显示名，两边对不上，AssetRipper 就找不到纹理像素。
+// 这里扫导出树把引用收齐，按「小写路径哈希 == 节点键」对上 manifest，给已导出的文件
+// 补一个规范名的硬链接（不占空间），下游按引用名就能直接打开。
+int cmdAlias(const std::string& exportRoot, const std::string& manifest, bool dryRun, int threads,
+             const std::string& refs) {
+    const qtsvfs::AliasResult r = qtsvfs::linkStreamAliases(
+        utf8ToPath(exportRoot), utf8ToPath(manifest), dryRun, threads,
+        refs.empty() ? std::filesystem::path{} : utf8ToPath(refs),
+        [](const qtsvfs::AliasResult& cur) {
+            std::printf("  … 已扫 %llu/%llu 个文件，引用 %llu，命中 %llu，已接 %llu\n",
+                        static_cast<unsigned long long>(cur.scanned),
+                        static_cast<unsigned long long>(cur.total),
+                        static_cast<unsigned long long>(cur.refs),
+                        static_cast<unsigned long long>(cur.hit),
+                        static_cast<unsigned long long>(cur.linked));
+            std::fflush(stdout);
+        });
+    std::printf("  → 扫 %llu 个文件：流引用 %llu 条，哈希命中 %llu，补硬链接 %llu，"
+                "本来就在 %llu，目标不在盘上 %llu，失败 %llu%s\n",
+                static_cast<unsigned long long>(r.scanned), static_cast<unsigned long long>(r.refs),
+                static_cast<unsigned long long>(r.hit), static_cast<unsigned long long>(r.linked),
+                static_cast<unsigned long long>(r.already), static_cast<unsigned long long>(r.stale),
+                static_cast<unsigned long long>(r.failed), dryRun ? "  [dry-run]" : "");
+    if (!r.error.empty()) {
+        std::printf("  最后一条错误: %s\n", r.error.c_str());
+    }
+    return r.error.empty() ? 0 : 3;
+}
 
 bool loadKeyset(const std::string& file, std::unordered_set<std::uint64_t>& out) {
     std::ifstream in(file);
@@ -1558,8 +1623,20 @@ void usage() {
         "  qtsvfs nodes <file.db> [--max=N]          解码 FileNode 与块表\n"
         "  qtsvfs layout <packageDir> --names=<名单> [--depth=N]\n"
         "                                      用名字表还原真实目录树（未定名标 [nameless]）\n"
-        "  qtsvfs export <packageDir> --names=<名单> --out=<目录> [--limit=N]\n"
+        "  qtsvfs export <packageDir>...|--packages=<root> [--names=<名单>] --out=<目录>\n"
+        "                [--nameless] [--no-obsolete] [--limit=N] [--manifest=tsv]\n"
+        "                [--threads=N] [--state=tsv] [--dir-prefix=32000] [--normalize]\n"
         "                                      按真实路径解包落盘（路径先规整，防 ../ 逃逸）\n"
+        "                                      多个包共用一棵输出树，同键只解一次、同名加尾巴\n"
+        "                                      --nameless 把未定名落进 [nameless]/前2位/HEX\n"
+        "                                      --threads 一个包一个线程并行解（0=按 CPU 数）\n"
+        "                                      --state 记已完成包，重跑自动续导并吃回旧 manifest\n"
+        "                                      --normalize 把载荷改回原厂 SerializedFile（空类型树 -> ett=0），\n"
+        "                                      UnityPy 这类通用解析器才读得动对象\n"
+        "  qtsvfs alias --export=<导出树> --manifest=<tsv> [--threads=N] [--refs=tsv] [--dry-run]\n"
+        "                                      SerializedFile 里 m_StreamData 写的是流节点的规范路径\n"
+        "                                      （assets/xx/哈希.resS），名字表多半给的是显示名，\n"
+        "                                      这里按路径哈希==节点键对上，补一个规范名硬链接（不占空间）\n"
         "  qtsvfs scan <packageDir>...|--packages=<root> [--max=N] [--maxsize=N]\n"
         "                [--bare --gindex=<GlobalIndexPrime.data>] [--out=tsv] [--all] [--trace]\n"
         "                                      批量解块，找自声明并用哈希自校验；--bare 找裸资源路径\n"
@@ -1698,28 +1775,84 @@ int main(int argc, char** argv) {
         return cmdExtract(files[0], hashHex, outPath);
     }
     if (sub == "export") {
-        const auto files = positional({});
-        if (files.empty()) {
-            std::fprintf(stderr, "export 需要包目录参数\n");
-            return 1;
-        }
-        std::string names, outDir;
+        auto files = positional({});
+        std::string names, outDir, manifest, pkgRoot, state;
         for (const auto& t : rest) {
             if (t.rfind("--names=", 0) == 0) {
                 names = t.substr(8);
             } else if (t.rfind("--out=", 0) == 0) {
                 outDir = t.substr(6);
+            } else if (t.rfind("--manifest=", 0) == 0) {
+                manifest = t.substr(11);
+            } else if (t.rfind("--state=", 0) == 0) {
+                state = t.substr(8);
+            } else if (t.rfind("--packages=", 0) == 0) {
+                pkgRoot = t.substr(11);
             }
         }
-        if (names.empty() || outDir.empty()) {
-            std::fprintf(stderr, "export 需要 --names=<名单> 与 --out=<目录>\n");
+        // 全库 1731 个包目录当参数传会超 Windows 命令行上限，自己枚举
+        if (!pkgRoot.empty()) {
+            std::string prefix;
+            for (const auto& t : rest) {
+                if (t.rfind("--dir-prefix=", 0) == 0) {
+                    prefix = t.substr(13);
+                }
+            }
+            for (const auto& e : std::filesystem::directory_iterator(utf8ToPath(pkgRoot))) {
+                if (!e.is_directory()) {
+                    continue;
+                }
+                if (!prefix.empty() && e.path().filename().string().rfind(prefix, 0) != 0) {
+                    continue;
+                }
+                files.push_back(e.path());
+            }
+            std::sort(files.begin(), files.end());
+        }
+        if (files.empty()) {
+            std::fprintf(stderr, "export 需要包目录参数或 --packages=<root>\n");
             return 1;
         }
-        std::uint64_t limit = 100000;
-        optValue("--limit", limit, 100000);
+        if (outDir.empty()) {
+            std::fprintf(stderr, "export 需要 --out=<目录>\n");
+            return 1;
+        }
+        std::uint64_t limit = 0;
+        optValue("--limit", limit, 0);
+        std::uint64_t threads = 0;
+        if (!optValue("--threads", threads, 0)) {
+            std::fprintf(stderr, "--threads 需要一个数字\n");
+            return 1;
+        }
         const bool nameless = std::any_of(rest.begin(), rest.end(),
                                           [](const std::string& t) { return t == "--nameless"; });
-        return cmdExport(files[0], names, outDir, limit, nameless);
+        const bool skipObsolete = std::any_of(rest.begin(), rest.end(),
+                                              [](const std::string& t) { return t == "--no-obsolete"; });
+        const bool normalize = std::any_of(rest.begin(), rest.end(),
+                                           [](const std::string& t) { return t == "--normalize"; });
+        return cmdExport(files, names, outDir, limit, nameless, skipObsolete, manifest, state,
+                         static_cast<int>(threads), normalize);
+    }
+    if (sub == "alias") {
+        std::string root, manifest, refs;
+        for (const auto& t : rest) {
+            if (t.rfind("--export=", 0) == 0) {
+                root = t.substr(9);
+            } else if (t.rfind("--manifest=", 0) == 0) {
+                manifest = t.substr(11);
+            } else if (t.rfind("--refs=", 0) == 0) {
+                refs = t.substr(7);
+            }
+        }
+        if (root.empty() || manifest.empty()) {
+            std::fprintf(stderr, "alias 需要 --export=<导出树> 与 --manifest=<tsv>\n");
+            return 1;
+        }
+        const bool dryRun = std::any_of(rest.begin(), rest.end(),
+                                         [](const std::string& t) { return t == "--dry-run"; });
+        std::uint64_t threads = 0;
+        optValue("--threads", threads, 0);
+        return cmdAlias(root, manifest, dryRun, static_cast<int>(threads), refs);
     }
     if (sub == "keys") {
         std::string outTsv, pkgRoot;

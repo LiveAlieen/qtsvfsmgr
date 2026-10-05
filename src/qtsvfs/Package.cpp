@@ -116,6 +116,16 @@ bool Package::indexVolume(Volume& v, std::string& err) {
     return true;
 }
 
+bool Package::dataPresent(std::uint64_t hash) {
+    for (auto& v : volumes_) {
+        std::string ignore;
+        if (indexVolume(*v, ignore) && v->byHash.count(hash)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool Package::readBlob(const FileNode& node, std::vector<std::uint8_t>& out, std::string& err) {
     const std::uint64_t hash = node.hash;
     std::vector<std::pair<Volume*, BlockRef>> all;

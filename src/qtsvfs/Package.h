@@ -25,6 +25,10 @@ public:
     // 按节点块表从数据卷取块，用块里声明的 method id 解压后按 (block, page) 拼接。
     bool readBlob(const FileNode& node, std::vector<std::uint8_t>& out, std::string& err);
 
+    // 数据卷里到底有没有这个节点的块（全库 14.5% 的节点在本机一个字节都没有，
+    // 导出时要把它们和「有字节但解不开」分开计数）。
+    bool dataPresent(std::uint64_t hash);
+
     std::size_t volumeCount() const noexcept { return volumes_.size(); }
 
 private:
