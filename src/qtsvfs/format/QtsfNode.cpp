@@ -65,7 +65,7 @@ bool FileNode::parse(const std::uint8_t* value, std::size_t len) {
         return false;
     }
     QtsfStream in(value, len);
-    zero0 = in.u32();
+    obsolete = in.u32();
     version = in.u32();
     hash = in.u64();
     size = in.u64();

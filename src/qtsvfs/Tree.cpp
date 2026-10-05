@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cinttypes>
 
-#include "qtsvfs/format/GlobalIndex.h"
 
 namespace qtsvfs {
 namespace {
@@ -62,7 +61,7 @@ TreeNode* descend(TreeNode* cur, const std::string& path, bool leafNamed, const 
 }  // namespace
 
 void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names, TreeNode& root,
-               TreeStats& stats, const SourceTable* sources, const GlobalIndex* manifest) {
+               TreeStats& stats, const SourceTable* sources) {
     root.name = "";
     root.path = "";
     root.dir = true;
@@ -81,9 +80,7 @@ void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names
                 }
             }
         } else {
-            const bool obsolete =
-                manifest && manifest->findPackage(static_cast<std::uint32_t>(node->hash & 0xFFFFFFFFu)) ==
-                                0xFFFF;
+            const bool obsolete = node->obsolete != 0;
             path = obsolete ? "/[obsolete]/" + hexU64(node->hash) : "/[nameless]/" + hexU64(node->hash);
             source = obsolete ? "obsolete" : "";
             if (obsolete) {

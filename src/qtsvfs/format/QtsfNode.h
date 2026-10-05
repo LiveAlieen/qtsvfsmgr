@@ -15,7 +15,11 @@ struct QtsfBlock {
 };
 
 struct FileNode {
-    std::uint32_t zero0 = 0;
+    // 原厂废弃标记。全库 1,674,850 个节点实测：0 有 1,339,450 个（80.0%），其中 98.4% 能在
+    // 当前 GlobalIndex 里找到、83.1% 已被定名；1 有 335,394 个（20.0%），只有 7.5% 还在清单里。
+    // 包 2/8/9/101/5165 分别复验过，方向一致 —— 这是 VFS 自己维护的逐节点墓碑位，
+    // 比「拿 fileHash 去清单里查不到」的推断更硬，且不依赖清单文件（小程序根也能用）。
+    std::uint32_t obsolete = 0;
     std::uint32_t version = 0;  // 观测如 0x00010016
     std::uint64_t hash = 0;     // 与记录 key 相同
     std::uint64_t size = 0;     // 未压缩总大小

@@ -10,8 +10,6 @@
 
 namespace qtsvfs {
 
-class GlobalIndex;
-
 struct TreeNode {
     std::string name;
     std::string path;  // 完整虚拟路径；目录以 '/' 结尾
@@ -38,15 +36,11 @@ struct TreeRow {
     std::string source;
 };
 
-// 用名字表把包内节点还原成真实目录树。没定名的节点单独收进 [nameless] 桶，
-// 不跟真名混在一起，覆盖率才看得见。sources 可为空，那样只留 named 布尔。
-// manifest（可空）= 当前版本的 GlobalIndex：未定名且其 fileHash（节点键低 32 位）
-// 不在清单里的，落进 [obsolete] 而不是 [nameless] —— 实测未定名节点只有 51.4% 在清单里，
-// 而已定名节点有 90.6%，且这种缺失是文件级散布（整包过期的只占 0.4%），
-// 所以那一半是原厂侧废弃的残留，跟「活着但取不到名字」不是一回事，得分开摆。
+// 用名字表把包内节点还原成真实目录树。没定名的节点按 FileNode::obsolete 分流：
+// 带废弃标记的进 [obsolete]（原厂已把它从清单里摘掉、数据还留在缓存），
+// 其余进 [nameless]（活着、只是这份缓存里取不到名字）。两个桶不混，覆盖率才看得见。
 void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names, TreeNode& root,
-               TreeStats& stats, const SourceTable* sources = nullptr,
-               const GlobalIndex* manifest = nullptr);
+               TreeStats& stats, const SourceTable* sources = nullptr);
 
 // 按「目录在前、名字在后」稳定排序，供界面与文本输出用同一套顺序。
 void sortTree(TreeNode& node);

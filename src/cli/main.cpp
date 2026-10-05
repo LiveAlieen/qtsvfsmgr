@@ -294,7 +294,7 @@ int cmdRaw(const std::filesystem::path& p, const std::string& keyHex, std::uint6
     return 0;
 }
 
-int cmdNodes(const std::filesystem::path& p, std::uint64_t limit) {
+int cmdNodes(const std::filesystem::path& p, std::uint64_t limit, bool fields = false) {
     qtsvfs::FileReader fr;
     qtsvfs::KdbFile db;
     std::string err;
@@ -311,6 +311,20 @@ int cmdNodes(const std::filesystem::path& p, std::uint64_t limit) {
                 return true;
             }
             ++parsed;
+            if (fields) {
+                // 全字段 TSV：查「已定名 vs 未定名」是否在某个头字段上系统性不同
+                std::printf("%016llX\t%llu\t%u\t%u\t%llu\t%llu\t%u",
+                            static_cast<unsigned long long>(node.hash),
+                            static_cast<unsigned long long>(node.size), node.obsolete, node.version,
+                            static_cast<unsigned long long>(node.checkA),
+                            static_cast<unsigned long long>(node.checkB), node.blockCount);
+                for (const auto& b : node.blocks) {
+                    std::printf("\t0x%X:0x%08X:0x%X", b.startPos, b.packed, b.blockSize);
+                }
+                std::printf("\n");
+                ++shown;
+                return true;
+            }
             if (shown < limit) {
                 std::printf("%016llX size=%-10llu ver=0x%08X blocks=%u", static_cast<unsigned long long>(node.hash),
                             static_cast<unsigned long long>(node.size), node.version, node.blockCount);
@@ -1171,8 +1185,7 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
 }
 
 int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
-              std::uint64_t depthLimit, const std::string& outTsv,
-              const std::string& gindexPath) {
+              std::uint64_t depthLimit, const std::string& outTsv) {
     qtsvfs::NameTable table;
     qtsvfs::SourceTable sources;
     std::string err;
@@ -1181,15 +1194,6 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
         return 2;
     }
     qtsvfs::makeUnique(table);
-    // 给了当前版本清单就把「未定名」再切一刀：不在清单里的是原厂废弃的残留
-    std::unique_ptr<qtsvfs::GlobalIndex> manifest;
-    if (!gindexPath.empty()) {
-        manifest = std::make_unique<qtsvfs::GlobalIndex>();
-        if (!manifest->load(utf8ToPath(gindexPath), err)) {
-            std::fprintf(stderr, "GlobalIndex 读不到: %s\n", err.c_str());
-            return 2;
-        }
-    }
     qtsvfs::Package pkg;
     if (!pkg.open(pkgDir, err) || !pkg.loadNodes(err)) {
         std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
@@ -1203,17 +1207,15 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
     }
     qtsvfs::TreeNode root;
     qtsvfs::TreeStats st;
-    qtsvfs::buildTree(nodes, table, root, st, &sources, manifest.get());
+    qtsvfs::buildTree(nodes, table, root, st, &sources);
     qtsvfs::sortTree(root);
     std::printf("包 %s：节点 %zu，真名 %llu，未定名 %llu，未压总字节 %llu（名字表 %zu 条）\n",
                 pkgDir.filename().string().c_str(), nodes.size(),
                 static_cast<unsigned long long>(st.named),
                 static_cast<unsigned long long>(st.nameless),
                 static_cast<unsigned long long>(st.bytes), table.size());
-    if (manifest) {
-        std::printf("  未定名里 %llu 个的 fileHash 不在当前 GlobalIndex（判为原厂废弃，收进 [obsolete]）\n",
-                    static_cast<unsigned long long>(st.obsolete));
-    }
+    std::printf("  未定名里 %llu 个带原厂废弃标记（收进 [obsolete]）\n",
+                static_cast<unsigned long long>(st.obsolete));
     qtsvfs::TreeStats walked;
     qtsvfs::printTree(root, stdout, 0, depthLimit, walked);
     std::printf("  → 打印目录 %llu，文件 %llu（含未定名 %llu）\n",
@@ -1750,12 +1752,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "layout 需要包目录参数，如 packages/101\n");
             return 1;
         }
-        std::string names, outTsv, gindex;
+        std::string names, outTsv;
         for (const auto& t : rest) {
             if (t.rfind("--names=", 0) == 0) {
                 names = t.substr(8);
-            } else if (t.rfind("--gindex=", 0) == 0) {
-                gindex = t.substr(9);
             } else if (t.rfind("--out=", 0) == 0) {
                 outTsv = t.substr(6);
             }
@@ -1766,7 +1766,7 @@ int main(int argc, char** argv) {
         }
         std::uint64_t depth = 3;
         optValue("--depth", depth, 3);
-        return cmdLayout(files[0], names, depth, outTsv, gindex);
+        return cmdLayout(files[0], names, depth, outTsv);
     }
     if (sub == "scan") {
         auto files = positional({});
@@ -1945,7 +1945,8 @@ int main(int argc, char** argv) {
         }
         std::uint64_t max = 20;
         optValue("--max", max, 20);
-        return cmdNodes(files[0], max);
+        return cmdNodes(files[0], max, std::any_of(rest.begin(), rest.end(),
+                                                    [](const std::string& t) { return t == "--fields"; }));
     }
     if (sub == "mergenames") {
         std::string outTsv;
