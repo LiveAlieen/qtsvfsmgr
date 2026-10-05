@@ -28,7 +28,7 @@ bool loadNameTable(const std::filesystem::path& file, NameTable& out, std::strin
             path = line.substr(17);
         } else {
             tag = line.substr(17, t2 - 17);
-            if (tag != "named" && tag != "real" && tag != "object") {
+            if (tag != "named" && tag != "real" && tag != "object" && tag != "tree") {
                 continue;
             }
             const std::size_t t3 = line.find('\t', t2 + 1);

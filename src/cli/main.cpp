@@ -25,6 +25,7 @@
 #include "qtsvfs/Catalog.h"
 #include "qtsvfs/Export.h"
 #include "qtsvfs/Names.h"
+#include "qtsvfs/NodeTree.h"
 #include "qtsvfs/Tree.h"
 #include "qtsvfs/format/GlobalIndex.h"
 #include "qtsvfs/format/Kdb.h"
@@ -521,6 +522,9 @@ struct BareStats {
     // catalog 定名：同一条记录里「资源真名 + 声明路径」成对出现，路径过了哈希闸门后，
     // 把真名挂到那个节点上。比 named 更接近用户要的「不是哈希树」。
     std::unordered_map<std::uint64_t, std::string> namedReal;
+    // 节点树索引（exporter::Node 格式）：名字与节点键在同一条记录里成对出现，权威定名
+    std::unordered_map<std::uint64_t, std::string> namedTree;
+    std::uint64_t treeFiles = 0;
     // 节点体内只有一个资源名字段的单资源节点：名字来自「它自己就是那个资源的数据」
     std::unordered_map<std::uint64_t, std::string> selfNames;
     std::uint64_t catalogEntries = 0;
@@ -971,6 +975,18 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
             scanBarePaths(text, node, bs, gi, pkg.nodes(), os ? &os : nullptr, showAll, prefixes,
                           keyset);
             scanCatalog(text, node, bs, pkg.nodes(), os ? &os : nullptr, keyset);
+            std::vector<qtsvfs::NodeTreeEntry> entries;
+            if (qtsvfs::parseNodeTree(blob.data(), blob.size(), entries)) {
+                ++bs.treeFiles;
+                for (const auto& e : entries) {
+                    bs.namedTree.try_emplace(e.hash, e.path);
+                    if (os) {
+                        os << std::hex << std::uppercase << std::setw(16) << std::setfill('0')
+                           << e.hash << "\ttree\tnodetree\t" << e.path << '\n'
+                           << std::dec;
+                    }
+                }
+            }
             // 顺序即优先级：脚本节点先看运行时自声明的模块路径，再看序列化资源名。
             scanInGamePath(text, node, bs, os ? &os : nullptr);
             qtsvfs::SelfName sn;
@@ -1064,6 +1080,9 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
                     static_cast<unsigned long long>(bs.catalogEntries),
                     static_cast<unsigned long long>(bs.namedReal.size()),
                     static_cast<unsigned long long>(bs.selfNames.size()));
+        std::printf("  节点树索引文件=%llu 个，其中文件节点=%llu\n",
+                    static_cast<unsigned long long>(bs.treeFiles),
+                    static_cast<unsigned long long>(bs.namedTree.size()));
         if (os) {
             for (const auto& [h, p] : bs.named) {
                 os << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << h
@@ -1382,7 +1401,7 @@ int cmdMergeNames(const std::vector<std::filesystem::path>& ins, const std::stri
             if (path.empty()) {
                 continue;
             }
-            if (tag != "real" && tag != "object" && tag != "named") {
+            if (tag != "real" && tag != "object" && tag != "named" && tag != "tree") {
                 continue;
             }
             if (tag == "object" && sub == "objname") {
@@ -1392,7 +1411,10 @@ int cmdMergeNames(const std::vector<std::filesystem::path>& ins, const std::stri
                     continue;
                 }
             }
-            const int rank = tag == "real" ? 0 : tag == "object" ? 1 : 2;
+            // tree 最优先：名字与节点键在同一条记录里成对出现，是权威表；
+            // 其次 real（catalog 真名，路径过了哈希闸门），再 object（体内自声明），最后 named。
+            const int rank =
+                tag == "tree" ? 0 : tag == "real" ? 1 : tag == "object" ? 2 : 3;
             const std::uint64_t h = std::strtoull(line.substr(0, 16).c_str(), nullptr, 16);
             if (h == 0) {
                 continue;
@@ -1414,7 +1436,7 @@ int cmdMergeNames(const std::vector<std::filesystem::path>& ins, const std::stri
     }
 
     for (auto& [h, b] : map) {
-        if (b.rank == 2) {
+        if (b.rank == 3) {
             continue;  // named 本身就是完整路径，不需要借目录
         }
         const std::size_t slash = b.path.rfind('/');
