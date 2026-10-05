@@ -996,9 +996,12 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
                                  "/" + (sn.dir.empty() ? "" : sn.dir + "/") + sn.name)
                     .second &&
                 os) {
+                const char* tag = sn.fromPath ? "\tobject\tobjpath\t"
+                                : sn.confident ? "\tobject\tselfname\t"
+                                               : "\tobject\tobjname\t";
                 os << std::hex << std::uppercase << std::setw(16) << std::setfill('0')
-                   << node->hash << (sn.confident ? "\tobject\tselfname\t" : "\tobject\tobjname\t")
-                   << "/" << (sn.dir.empty() ? "" : sn.dir + "/") << sn.name << '\n'
+                   << node->hash << tag << "/" << (sn.dir.empty() ? "" : sn.dir + "/") << sn.name
+                   << '\n'
                    << std::dec;
             }
         }

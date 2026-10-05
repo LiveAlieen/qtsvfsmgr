@@ -31,6 +31,7 @@ struct SelfName {
     std::string name;  // 体内声明的资源名（原样，含空格）
     std::string dir;   // 节点声明的资源流路径的目录，形如 assets/29；没有则空
     bool confident;    // true=体内只有这一个名字，字段就是资源名本身
+    bool fromPath = false;  // true=名字其实是 bundle 内部资源路径（没有名字字段时的兜底）
 };
 
 // confident 判定：体内只有 1 个（或 2 个相同）名字字段 → 直接用。

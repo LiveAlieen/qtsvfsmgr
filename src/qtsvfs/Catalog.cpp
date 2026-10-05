@@ -45,6 +45,8 @@ bool pathLike(const std::string& s) {
 // 资源真名：不含 '/'、不含 '.'（带点的是版本号/文件名那类字段）。
 // 首字符是 '_' 的排除掉：那是着色器属性/关键字（_HSVConversionMatrix_B、_SGAME_POINT_LIGHT_ON），
 // 实测包 8 里这类串会以 2.8 万次的量级重复出现，当成文件名等于什么都没定名。
+// 允许 [ ] —— Unity 重名后缀就是 `名字 [1]`，实测包 101 有整批 mesh 合并产物叫
+// PJD_M_03JungleGrassA_09 [1]_vertex_color_mesh_mid，挡掉方括号就把它们全丢了。
 // 纯数字也算名字（包 305000000906 那批资源的名字槽里放的就是资源号 100502/190360），
 // 但打分时带字母的必须压过纯数字，见 parseSelfName。
 bool nameLike(const std::string& s) {
@@ -57,7 +59,7 @@ bool nameLike(const std::string& s) {
         const unsigned char u = static_cast<unsigned char>(c);
         const bool ok = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
                         (u >= '0' && u <= '9') || c == '_' || c == '-' || c == ' ' || c == '(' ||
-                        c == ')';
+                        c == ')' || c == '[' || c == ']';
         if (!ok) {
             return false;
         }
@@ -69,6 +71,35 @@ bool nameLike(const std::string& s) {
         }
     }
     return letter || (digit && s.size() >= 4);
+}
+
+// bundle 内部资源路径：形如 prefab_skill_effects/tongyong_effects/…/jidibaozha_normal_01、
+// common/room.gl。它们不指向 VFS 节点（哈希不上），但确实是这个资源自己声明的身份。
+// 排除末段是长十六进制串的（assets/fd/fd090a….resS 那是兄弟流的路径，拿来当自己的名字会撞车）。
+bool internalPathLike(const std::string& s) {
+    if (s.size() < 8 || s.size() > 120 || s.find('/') == std::string::npos) {
+        return false;
+    }
+    for (char c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        const bool ok = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
+                        (u >= '0' && u <= '9') || c == '_' || c == '-' || c == '.' || c == '/' ||
+                        c == ' ';
+        if (!ok) {
+            return false;
+        }
+    }
+    const std::size_t slash = s.rfind('/');
+    const std::string last = s.substr(slash + 1);
+    std::size_t hex = 0;
+    for (char c : last) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        const bool isHex = (u >= '0' && u <= '9') || (u >= 'a' && u <= 'f') || (u >= 'A' && u <= 'F');
+        if (isHex) {
+            ++hex;
+        }
+    }
+    return hex < 16;
 }
 
 // 只有「引擎序列化资源文件」才允许拿体内字段当文件名：这类文件的头 64 字节里带
@@ -180,8 +211,30 @@ bool parseSelfName(const std::uint8_t* data, std::size_t size, SelfName& out) {
             names.push_back(&val);
         }
     }
-    if (names.empty() || pathCount > 1) {
-        return false;  // 没名字，或者本体是聚合 bundle（一个文件装多个资源）
+    if (pathCount > 1) {
+        return false;  // 本体是聚合 bundle（一个文件装多个资源），取哪个名字都不对
+    }
+    if (names.empty()) {
+        // 没有名字字段时，退一步用体内声明的 bundle 内部路径当名字（例：common/room.gl、
+        // prefab_skill_effects/tongyong_effects/…/jidibaozha_normal_01）。
+        // 这类串哈希不到节点键，所以它是「资源自己说的身份」而不是「VFS 路径」，
+        // 来源单独标成 objpath，不跟前几层混。
+        const std::string* bestPath = nullptr;
+        for (const auto& [off, val] : fields) {
+            if (pathLike(val)) {
+                continue;
+            }
+            if (internalPathLike(val) && (!bestPath || val.size() > bestPath->size())) {
+                bestPath = &val;
+            }
+        }
+        if (!bestPath) {
+            return false;
+        }
+        out.confident = false;
+        out.fromPath = true;
+        out.name = *bestPath;
+        return true;
     }
     const bool single = names.size() == 1 || (names.size() == 2 && *names[0] == *names[1]);
     const std::string* pick = names[0];
