@@ -28,6 +28,7 @@
 #include "qtsvfs/Package.h"
 #include "qtsvfs/Tree.h"
 #include "qtsvfs/codec/Codec.h"
+#include "qtsvfs/format/GlobalIndex.h"
 
 namespace {
 
@@ -239,16 +240,31 @@ bool MainWindow::openPath(const std::filesystem::path& dir, std::string& err) {
         (void)h;
         holder->nodes.push_back(&n);
     }
-    qtsvfs::buildTree(holder->nodes, names_, holder->root, holder->stats, &sources_);
+    // 当前版本清单：未定名且 fileHash 不在其中的节点，是原厂废弃的残留，单独进 [obsolete]
+    if (!manifest_) {
+        const auto giPath = dir.parent_path() / "builtin" / "Globalindex" / "GlobalIndexPrime.data";
+        std::string gerr;
+        auto gi = std::make_unique<qtsvfs::GlobalIndex>();
+        if (gi->load(giPath, gerr)) {
+            manifest_ = std::move(gi);
+        }
+    }
+    qtsvfs::buildTree(holder->nodes, names_, holder->root, holder->stats, &sources_,
+                      manifest_.get());
     qtsvfs::sortTree(holder->root);
     pkgDir_ = dir;
     pkg_ = std::move(holder);
     setWindowTitle(QString::fromUtf8("QtsVFS 管理器 — %1").arg(qFromPath(pkgDir_.filename())));
     fillTree();
-    info_->setText(QString::fromUtf8("节点 %1，真名 %2，未定名 %3，未压 %4")
+    const bool hasManifest = static_cast<bool>(manifest_);
+    info_->setText(QString::fromUtf8("节点 %1，真名 %2，未定名 %3%4，未压 %5")
                        .arg(pkg_->nodes.size())
                        .arg(pkg_->stats.named)
                        .arg(pkg_->stats.nameless)
+                       .arg(hasManifest && pkg_->stats.obsolete
+                                ? QString::fromUtf8("（其中 %1 个不在当前清单，判为废弃）")
+                                      .arg(pkg_->stats.obsolete)
+                                : QString())
                        .arg(human(pkg_->stats.bytes)));
     setStatus(QString::fromUtf8("已打开 %1").arg(qFromPath(pkgDir_)));
 }
@@ -270,11 +286,14 @@ void MainWindow::fillTree() {
                 item->setText(2, QString::fromUtf8(qtsvfs::methodName(n.method)));
                 // 来源要能说清成立依据：过了哈希闸门的和只靠「名字在本节点体内」的不是一回事
                 static const QHash<QByteArray, const char*> kSourceText = {
+                    {"tree:nodetree", "节点树索引"},
                     {"real:catalog", "真名(catalog)"},
                     {"object:selfname", "体内自声明"},
                     {"object:objname", "体内名字(择优)"},
+                    {"object:objpath", "体内路径(兜底)"},
                     {"object:ingamepath", "模块路径"},
                     {"named", "哈希路径"},
+                    {"obsolete", "废弃·不在当前清单"},
                 };
                 const auto it = kSourceText.constFind(QByteArray(n.source.c_str()));
                 item->setText(4, it == kSourceText.constEnd()

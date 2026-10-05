@@ -16,6 +16,10 @@ class QTreeWidgetItem;
 class QPlainTextEdit;
 class QLabel;
 
+namespace qtsvfs {
+class GlobalIndex;
+}
+
 struct PkgHolder;
 
 // 后台解包导出，不阻塞界面：进度与完成信号回到主线程刷新进度条。
@@ -75,6 +79,7 @@ private:
     std::filesystem::path namesPath_;
     qtsvfs::NameTable names_;
     qtsvfs::SourceTable sources_;
+    std::unique_ptr<qtsvfs::GlobalIndex> manifest_;  // 当前版本清单，可为空（找不到索引文件）
     std::unique_ptr<PkgHolder> pkg_;
     ExportWorker* worker_ = nullptr;
 };

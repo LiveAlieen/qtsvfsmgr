@@ -1171,7 +1171,8 @@ int cmdScan(const std::filesystem::path& pkgDir, std::uint64_t maxNodes, std::ui
 }
 
 int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
-              std::uint64_t depthLimit, const std::string& outTsv) {
+              std::uint64_t depthLimit, const std::string& outTsv,
+              const std::string& gindexPath) {
     qtsvfs::NameTable table;
     qtsvfs::SourceTable sources;
     std::string err;
@@ -1180,6 +1181,15 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
         return 2;
     }
     qtsvfs::makeUnique(table);
+    // 给了当前版本清单就把「未定名」再切一刀：不在清单里的是原厂废弃的残留
+    std::unique_ptr<qtsvfs::GlobalIndex> manifest;
+    if (!gindexPath.empty()) {
+        manifest = std::make_unique<qtsvfs::GlobalIndex>();
+        if (!manifest->load(utf8ToPath(gindexPath), err)) {
+            std::fprintf(stderr, "GlobalIndex 读不到: %s\n", err.c_str());
+            return 2;
+        }
+    }
     qtsvfs::Package pkg;
     if (!pkg.open(pkgDir, err) || !pkg.loadNodes(err)) {
         std::fprintf(stderr, "打开包或读 FileNode 失败: %s\n", err.c_str());
@@ -1193,13 +1203,17 @@ int cmdLayout(const std::filesystem::path& pkgDir, const std::string& namesFile,
     }
     qtsvfs::TreeNode root;
     qtsvfs::TreeStats st;
-    qtsvfs::buildTree(nodes, table, root, st, &sources);
+    qtsvfs::buildTree(nodes, table, root, st, &sources, manifest.get());
     qtsvfs::sortTree(root);
     std::printf("包 %s：节点 %zu，真名 %llu，未定名 %llu，未压总字节 %llu（名字表 %zu 条）\n",
                 pkgDir.filename().string().c_str(), nodes.size(),
                 static_cast<unsigned long long>(st.named),
                 static_cast<unsigned long long>(st.nameless),
                 static_cast<unsigned long long>(st.bytes), table.size());
+    if (manifest) {
+        std::printf("  未定名里 %llu 个的 fileHash 不在当前 GlobalIndex（判为原厂废弃，收进 [obsolete]）\n",
+                    static_cast<unsigned long long>(st.obsolete));
+    }
     qtsvfs::TreeStats walked;
     qtsvfs::printTree(root, stdout, 0, depthLimit, walked);
     std::printf("  → 打印目录 %llu，文件 %llu（含未定名 %llu）\n",
@@ -1736,10 +1750,12 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "layout 需要包目录参数，如 packages/101\n");
             return 1;
         }
-        std::string names, outTsv;
+        std::string names, outTsv, gindex;
         for (const auto& t : rest) {
             if (t.rfind("--names=", 0) == 0) {
                 names = t.substr(8);
+            } else if (t.rfind("--gindex=", 0) == 0) {
+                gindex = t.substr(9);
             } else if (t.rfind("--out=", 0) == 0) {
                 outTsv = t.substr(6);
             }
@@ -1750,7 +1766,7 @@ int main(int argc, char** argv) {
         }
         std::uint64_t depth = 3;
         optValue("--depth", depth, 3);
-        return cmdLayout(files[0], names, depth, outTsv);
+        return cmdLayout(files[0], names, depth, outTsv, gindex);
     }
     if (sub == "scan") {
         auto files = positional({});

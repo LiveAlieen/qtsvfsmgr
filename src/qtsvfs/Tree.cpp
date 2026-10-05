@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cinttypes>
 
+#include "qtsvfs/format/GlobalIndex.h"
+
 namespace qtsvfs {
 namespace {
 
@@ -60,7 +62,7 @@ TreeNode* descend(TreeNode* cur, const std::string& path, bool leafNamed, const 
 }  // namespace
 
 void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names, TreeNode& root,
-               TreeStats& stats, const SourceTable* sources) {
+               TreeStats& stats, const SourceTable* sources, const GlobalIndex* manifest) {
     root.name = "";
     root.path = "";
     root.dir = true;
@@ -68,12 +70,24 @@ void buildTree(const std::vector<const FileNode*>& nodes, const NameTable& names
     for (const FileNode* node : nodes) {
         const auto it = names.find(node->hash);
         const bool named = it != names.end();
-        const std::string path = named ? it->second : "/[nameless]/" + hexU64(node->hash);
         std::string source;
-        if (named && sources) {
-            const auto s = sources->find(node->hash);
-            if (s != sources->end()) {
-                source = s->second;
+        std::string path;
+        if (named) {
+            path = it->second;
+            if (sources) {
+                const auto s = sources->find(node->hash);
+                if (s != sources->end()) {
+                    source = s->second;
+                }
+            }
+        } else {
+            const bool obsolete =
+                manifest && manifest->findPackage(static_cast<std::uint32_t>(node->hash & 0xFFFFFFFFu)) ==
+                                0xFFFF;
+            path = obsolete ? "/[obsolete]/" + hexU64(node->hash) : "/[nameless]/" + hexU64(node->hash);
+            source = obsolete ? "obsolete" : "";
+            if (obsolete) {
+                ++stats.obsolete;
             }
         }
         descend(&root, path, named, *node, stats, source);
@@ -127,7 +141,8 @@ void printTree(const TreeNode& node, std::FILE* out, std::uint64_t depth, std::u
             }
             std::fprintf(out, "%s  %s size=%" PRIu64 " m=%u%s\n", k.name.c_str(),
                          hexU64(k.hash).c_str(), static_cast<unsigned long long>(k.size),
-                         static_cast<unsigned>(k.method), k.named ? "" : "  [nameless]");
+                         static_cast<unsigned>(k.method),
+                         k.named ? "" : (k.source == "obsolete" ? "  [obsolete]" : "  [nameless]"));
         }
     }
 }
