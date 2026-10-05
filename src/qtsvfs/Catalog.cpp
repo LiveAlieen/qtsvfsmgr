@@ -45,8 +45,10 @@ bool pathLike(const std::string& s) {
 // 资源真名：不含 '/'、不含 '.'（带点的是版本号/文件名那类字段）。
 // 首字符是 '_' 的排除掉：那是着色器属性/关键字（_HSVConversionMatrix_B、_SGAME_POINT_LIGHT_ON），
 // 实测包 8 里这类串会以 2.8 万次的量级重复出现，当成文件名等于什么都没定名。
-// 允许 [ ] —— Unity 重名后缀就是 `名字 [1]`，实测包 101 有整批 mesh 合并产物叫
-// PJD_M_03JungleGrassA_09 [1]_vertex_color_mesh_mid，挡掉方括号就把它们全丢了。
+// 允许 [ ] 与 @ —— 统计过名字位上真实出现过的非字母数字字符：`_` 7004、`@` 281
+// （PJD_M_03JungleGrassB_03@@_low）、`[`/`]` 各 200（Unity 重名后缀 `名字 [1]`）、
+// `-` 92、空格 36。长尾那些 `` ` ! < ? > = ; # % ~ + : `` 都只出现 1~2 次且例子是
+// `!I<`、`K~Z` 这类二进制噪声，不收。
 // 纯数字也算名字（包 305000000906 那批资源的名字槽里放的就是资源号 100502/190360），
 // 但打分时带字母的必须压过纯数字，见 parseSelfName。
 bool nameLike(const std::string& s) {
@@ -59,7 +61,7 @@ bool nameLike(const std::string& s) {
         const unsigned char u = static_cast<unsigned char>(c);
         const bool ok = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
                         (u >= '0' && u <= '9') || c == '_' || c == '-' || c == ' ' || c == '(' ||
-                        c == ')' || c == '[' || c == ']';
+                        c == ')' || c == '[' || c == ']' || c == '@';
         if (!ok) {
             return false;
         }

@@ -222,7 +222,6 @@ int cmdKdbRecords(const std::filesystem::path& p, std::uint64_t limit, bool hist
                             toHexU32(r.hash1).c_str(), toHexU32(r.hash2).c_str(), r.keyLen,
                             r.valueLen, head ? "  [QTSF_PACKAGE]" : "",
                             qtsvfs::hexdump(r.key.data(), std::min<std::size_t>(r.key.size(), 16), 0)
-                                .substr(0, 8)
                                 .c_str());
                 ++shown;
             }
