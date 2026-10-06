@@ -53,6 +53,9 @@ struct HarvestOptions {
     std::uint64_t maxNodeSize = 64ull * 1024 * 1024;  // 超过这么大的块不碰
     std::uint64_t maxNodes = 0;                        // 每包最多解多少节点，0=不限（采样用）
     std::size_t textLimit = 0;                         // 每个节点最多扫多少明文字节，0=不限
+    // 只收 catalog/nodetree 的目录段，跳过 barePaths/inGamePath/selfName。
+    // buildDirIndex 用：后三者的产物在目录索引里本来就被丢弃，barePaths 还最贵（逐字节扫）。
+    bool dirsOnly = false;
 };
 
 // 默认挂载根：官方白名单树里出现的两个根 + 实测裸路径命中过的两个根 + /exportdata。
@@ -121,11 +124,13 @@ struct Library {
 // 展开根并建两道索引。withKeyset / withDirs 关掉时退化成「只用本包信息」：快，
 // 但跨包引用的路径定不出名、体内自声明的名字也没有目录段可借（实测包 101 约三成）。
 // progress(stage, done, total) 在 worker 线程里调用，实现要自己保证线程安全。
+// scopeFilter 非空时只把匹配的包放进 scope（建索引用），pkgs 不受影响。
 Library openLibrary(const std::vector<std::filesystem::path>& roots, int threads, bool withKeyset,
                     bool withDirs,
                     const std::function<void(const std::string& stage, std::size_t done,
                                              std::size_t total)>& progress = {},
-                    const std::filesystem::path& cachePath = {});
+                    const std::filesystem::path& cachePath = {},
+                    const std::function<bool(const PackageRef&)>& scopeFilter = {});
 
 // 现算一个包的名单并建好目录树；同目录重复调用直接复用缓存。失败返回空指针。
 // 树是全量的，界面那边按目录节点限量铺 item（超大包一个目录几万个文件时不至于卡死）。

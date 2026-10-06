@@ -90,7 +90,7 @@ void KeySet::build(const std::vector<PackageRef>& pkgs, int threads,
     if (threads <= 0) {
         threads = static_cast<int>(std::thread::hardware_concurrency());
     }
-    threads = std::max(1, std::min(threads, 32));
+    threads = std::max(1, std::min(threads, 64));
 
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> done{0};

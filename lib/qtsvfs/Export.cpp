@@ -372,7 +372,7 @@ ExportSummary exportAll(const std::vector<PackageRef>& pkgs,
     if (threads <= 0) {
         threads = static_cast<int>(std::thread::hardware_concurrency());
     }
-    threads = std::max(1, std::min(threads, 32));
+    threads = std::max(1, std::min(threads, 64));
     s.total.resumed = pkgs.size() - todo.size();
     s.total.pending = todo.size();
 

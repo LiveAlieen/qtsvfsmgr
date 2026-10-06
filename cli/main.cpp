@@ -518,7 +518,17 @@ bool markerKeyAt(const std::string& text, std::size_t pos, std::size_t& keyStart
 }
 
 qtsvfs::Library openImport(const std::vector<std::filesystem::path>& roots, int threads,
-                           bool withKeyset, bool withDirs) {
+                           bool withKeyset, bool withDirs, const std::string& prefix = {}) {
+    std::function<bool(const qtsvfs::PackageRef&)> filter;
+    if (!prefix.empty()) {
+        filter = [&](const qtsvfs::PackageRef& r) {
+            // 检查包目录名或其父目录名是否匹配前缀（小程序的包目录是 MiniApp_XXX/0）
+            const std::string name = r.dir.filename().string();
+            if (name.rfind(prefix, 0) == 0) return true;
+            const std::string parent = r.dir.parent_path().filename().string();
+            return parent.rfind(prefix, 0) == 0;
+        };
+    }
     qtsvfs::Library lib = qtsvfs::openLibrary(
         roots, threads, withKeyset, withDirs,
         [](const std::string& stage, std::size_t done, std::size_t total) {
@@ -526,7 +536,8 @@ qtsvfs::Library openImport(const std::vector<std::filesystem::path>& roots, int 
                 std::printf("  %s %zu/%zu", stage.c_str(), done, total);
                 std::fflush(stdout);
             }
-        });
+        },
+        {}, filter);
     std::map<std::string, std::size_t> perMount;
     for (const auto& ref : lib.pkgs) {
         ++perMount[ref.mount];
@@ -1493,12 +1504,15 @@ int main(int argc, char** argv) {
                                               [](const std::string& t) { return t == "--no-obsolete"; });
         const bool normalize = std::any_of(rest.begin(), rest.end(),
                                         [](const std::string& t) { return t == "--normalize"; });
-        qtsvfs::Library lib = openImport(roots, static_cast<int>(threads), !noKeyset, !noDirs);
+        qtsvfs::Library lib = openImport(roots, static_cast<int>(threads), !noKeyset, !noDirs, prefix);
         if (!prefix.empty()) {
-            // 只导一批包（皮肤包 32000*、小程序 MiniApp_* 之类），按包目录名前缀筛
+            // 只导一批包（皮肤包 32000*、小程序 MiniApp_* 之类），按包目录名或父目录名前缀筛
             lib.pkgs.erase(std::remove_if(lib.pkgs.begin(), lib.pkgs.end(),
                                          [&](const qtsvfs::PackageRef& r) {
-                                             return r.dir.filename().string().rfind(prefix, 0) != 0;
+                                             const std::string name = r.dir.filename().string();
+                                             if (name.rfind(prefix, 0) == 0) return false;
+                                             const std::string parent = r.dir.parent_path().filename().string();
+                                             return parent.rfind(prefix, 0) != 0;
                                          }),
                           lib.pkgs.end());
         }

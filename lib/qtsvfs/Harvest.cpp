@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <string_view>
 #include <thread>
@@ -333,11 +334,15 @@ void harvestPackage(Package& pkg, const HarvestOptions& options, std::vector<Nam
             bodyKinds->try_emplace(node->hash, measureCatalog(blob.data(), blob.size()));
         }
         harvestNodeTree(r, blob);
-        harvestBarePaths(r, blob, *node);
+        if (!opt.dirsOnly) {
+            harvestBarePaths(r, blob, *node);
+        }
         harvestCatalog(r, blob, *node);
-        // 顺序即优先级：脚本节点先看运行时自声明的模块路径，再看序列化资源名。
-        if (!harvestInGamePath(r, blob, *node)) {
-            harvestSelfName(r, blob, *node);
+        if (!opt.dirsOnly) {
+            // 顺序即优先级：脚本节点先看运行时自声明的模块路径，再看序列化资源名。
+            if (!harvestInGamePath(r, blob, *node)) {
+                harvestSelfName(r, blob, *node);
+            }
         }
         blob.clear();
     }
@@ -417,7 +422,7 @@ void buildDirIndex(const std::vector<PackageRef>& pkgs, const KeySet* keyset,
     if (threads <= 0) {
         threads = static_cast<int>(std::thread::hardware_concurrency());
     }
-    threads = std::max(1, std::min(threads, 32));
+    threads = std::max(1, std::min(threads, 64));
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> done{0};
     std::vector<DirIndex> perThread(static_cast<std::size_t>(threads));
@@ -427,12 +432,14 @@ void buildDirIndex(const std::vector<PackageRef>& pkgs, const KeySet* keyset,
             if (i >= pkgs.size()) {
                 break;
             }
+            auto t0 = std::chrono::steady_clock::now();
             Package pkg;
             std::string err;
             if (pkg.open(pkgs[i].dir, err) && pkg.loadNodes(err)) {
                 HarvestOptions ho;
                 ho.keyset = keyset;
                 ho.prefixes = prefixes;
+                ho.dirsOnly = true;
                 std::vector<NameRow> rows;
                 HarvestStats stats;
                 harvestPackage(pkg, ho, rows, stats);
@@ -447,6 +454,14 @@ void buildDirIndex(const std::vector<PackageRef>& pkgs, const KeySet* keyset,
                     }
                     local.try_emplace(r.hash, r.path.substr(0, slash));
                 }
+            }
+            auto t1 = std::chrono::steady_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+            if (ms > 1000 || !err.empty()) {
+                std::fprintf(stderr, "[diridx] pkg %zu/%zu %s: %lld ms%s\n",
+                             i + 1, pkgs.size(), pkgs[i].dir.filename().string().c_str(),
+                             static_cast<long long>(ms), err.empty() ? "" : (" ERR: " + err).c_str());
+                std::fflush(stderr);
             }
             if (progress) {
                 progress(++done, pkgs.size());

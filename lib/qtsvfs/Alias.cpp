@@ -132,7 +132,7 @@ AliasResult linkStreamAliases(const std::filesystem::path& root, const std::file
     if (threads <= 0) {
         threads = static_cast<int>(std::thread::hardware_concurrency());
     }
-    threads = std::max(1, std::min(threads, 32));
+    threads = std::max(1, std::min(threads, 64));
     res.total = files.size();
 
     std::ofstream refsOut;

@@ -31,7 +31,8 @@ std::string Library::labelFor(const std::filesystem::path& dir) const {
 Library openLibrary(const std::vector<std::filesystem::path>& roots, int threads, bool withKeyset,
                     bool withDirs,
                     const std::function<void(const std::string&, std::size_t, std::size_t)>& progress,
-                    const std::filesystem::path& cachePath) {
+                    const std::filesystem::path& cachePath,
+                    const std::function<bool(const PackageRef&)>& scopeFilter) {
     Library lib;
 
     if (!cachePath.empty()) {
@@ -58,6 +59,11 @@ Library openLibrary(const std::vector<std::filesystem::path>& roots, int threads
         scopeRoots.push_back(isPackageDir(r) ? r.parent_path() : r);
     }
     lib.scope = discoverPackages(scopeRoots);
+    if (scopeFilter) {
+        lib.scope.erase(std::remove_if(lib.scope.begin(), lib.scope.end(),
+                                       [&](const PackageRef& r) { return !scopeFilter(r); }),
+                        lib.scope.end());
+    }
     if (withKeyset) {
         lib.keys.build(lib.scope, threads, [&](std::size_t done, std::size_t total) {
             if (progress) {
