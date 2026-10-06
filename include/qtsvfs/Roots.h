@@ -55,6 +55,16 @@ public:
     bool empty() const noexcept { return keys_.empty(); }
     std::size_t size() const noexcept { return keys_.size(); }
 
+    using const_iterator = std::unordered_set<std::uint64_t>::const_iterator;
+    const_iterator begin() const noexcept { return keys_.begin(); }
+    const_iterator end() const noexcept { return keys_.end(); }
+
+    template <class It>
+    void load(It first, It last) {
+        keys_.clear();
+        keys_.insert(first, last);
+    }
+
 private:
     std::unordered_set<std::uint64_t> keys_;
 };

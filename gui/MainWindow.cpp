@@ -28,6 +28,7 @@
 #include <functional>
 #include <map>
 
+#include "qtsvfs/Cache.h"
 #include "qtsvfs/Export.h"
 #include "qtsvfs/Tree.h"
 #include "qtsvfs/codec/Codec.h"
@@ -91,12 +92,14 @@ const QHash<QByteArray, const char*>& sourceLabels() {
 }  // namespace
 
 void LibWorker::setJob(std::vector<std::filesystem::path> roots, std::filesystem::path outDir,
-                       qtsvfs::PackageRef target, Job kind, bool fullIndex) {
+                       qtsvfs::PackageRef target, Job kind, bool fullIndex,
+                       std::filesystem::path cachePath) {
     roots_ = std::move(roots);
     outDir_ = std::move(outDir);
     target_ = std::move(target);
     kind_ = kind;
     fullIndex_ = fullIndex;
+    cachePath_ = std::move(cachePath);
     cancelled_ = false;
 }
 
@@ -105,7 +108,8 @@ void LibWorker::run() {
         const auto report = [this](const std::string& stage, std::size_t done, std::size_t total) {
             emit progress(QString::fromUtf8(stage.c_str()), int(done), int(total));
         };
-        qtsvfs::Library next = qtsvfs::openLibrary(roots_, 0, fullIndex_, fullIndex_, report);
+        qtsvfs::Library next = qtsvfs::openLibrary(roots_, 0, fullIndex_, fullIndex_, report,
+                                                    cachePath_);
         if (next.pkgs.empty()) {
             emit failed(QString::fromUtf8(
                 "这些目录里没找到包（要含与目录同名的 .db 元数据卷）。\n"
@@ -120,7 +124,7 @@ void LibWorker::run() {
     if (kind_ == kHarvest) {
         const qtsvfs::PackageRef ref = target_;
         const std::string key = qtsvfs::pathKey(ref.dir);
-        if (!qtsvfs::openPackageEntry(*lib_, ref)) {
+        if (!qtsvfs::openPackageEntry(*lib_, ref, cachePath_)) {
             emit failed(QString::fromUtf8("打不开包或读不出 FileNode：%1")
                             .arg(QString::fromStdString(ref.label)));
             return;
@@ -227,16 +231,25 @@ void MainWindow::startJob(LibWorker::Job kind, std::vector<std::filesystem::path
     if (busy()) {
         return;
     }
+    std::filesystem::path cachePath;
+    if (!pkgDir_.empty()) {
+        if (kind == LibWorker::kHarvest) {
+            cachePath = qtsvfs::harvestCachePath(pkgDir_, qtsvfs::pathKey(target.dir));
+        } else {
+            cachePath = qtsvfs::libCachePath(pkgDir_);
+        }
+    }
     if (modal) {
-        progress_.reset(new QProgressDialog(QString::fromUtf8("正在忙…"), QString(), 0, 0, this));
+        progress_.reset(new QProgressDialog(QString::fromUtf8("正在忙…"), QString::fromUtf8("取消"),
+                                            0, 100, this));
         progress_->setWindowModality(Qt::WindowModal);
-        progress_->setMinimumDuration(0);
+        progress_->setMinimumDuration(500);
         progress_->setAutoReset(false);
     }
     thread_ = new QThread(this);
     worker_ = new LibWorker(lib_);
     worker_->moveToThread(thread_);
-    worker_->setJob(std::move(roots), outDir, target, kind, fullIndex);
+    worker_->setJob(std::move(roots), outDir, target, kind, fullIndex, std::move(cachePath));
     connect(thread_, &QThread::started, worker_, &LibWorker::run);
     connect(thread_, &QThread::finished, worker_, &QObject::deleteLater);
     connect(thread_, &QThread::finished, this, [this] {

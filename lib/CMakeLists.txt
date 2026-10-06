@@ -11,6 +11,7 @@ list(FILTER _ZSTD_SRC EXCLUDE REGEX "\\.[Ss]$")
 add_library(qtsvfs_core STATIC
     # ── 核心库 ──
     qtsvfs/Alias.cpp
+    qtsvfs/Cache.cpp
     qtsvfs/Catalog.cpp
     qtsvfs/Export.cpp
     qtsvfs/Harvest.cpp

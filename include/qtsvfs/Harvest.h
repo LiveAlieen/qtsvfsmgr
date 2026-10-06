@@ -124,10 +124,12 @@ struct Library {
 Library openLibrary(const std::vector<std::filesystem::path>& roots, int threads, bool withKeyset,
                     bool withDirs,
                     const std::function<void(const std::string& stage, std::size_t done,
-                                             std::size_t total)>& progress = {});
+                                             std::size_t total)>& progress = {},
+                    const std::filesystem::path& cachePath = {});
 
 // 现算一个包的名单并建好目录树；同目录重复调用直接复用缓存。失败返回空指针。
 // 树是全量的，界面那边按目录节点限量铺 item（超大包一个目录几万个文件时不至于卡死）。
-std::shared_ptr<PackageEntry> openPackageEntry(Library& lib, const PackageRef& ref);
+std::shared_ptr<PackageEntry> openPackageEntry(Library& lib, const PackageRef& ref,
+                                               const std::filesystem::path& cachePath = {});
 
 }  // namespace qtsvfs

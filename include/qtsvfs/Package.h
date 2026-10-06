@@ -30,6 +30,7 @@ public:
     bool dataPresent(std::uint64_t hash);
 
     std::size_t volumeCount() const noexcept { return volumes_.size(); }
+    const std::filesystem::path& dir() const noexcept { return dir_; }
 
 private:
     struct BlockRef {

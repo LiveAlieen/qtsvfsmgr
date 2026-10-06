@@ -5,6 +5,7 @@
 #include <map>
 #include <thread>
 
+#include "qtsvfs/Cache.h"
 #include "qtsvfs/Package.h"
 
 namespace qtsvfs {
@@ -29,15 +30,29 @@ std::string Library::labelFor(const std::filesystem::path& dir) const {
 
 Library openLibrary(const std::vector<std::filesystem::path>& roots, int threads, bool withKeyset,
                     bool withDirs,
-                    const std::function<void(const std::string&, std::size_t, std::size_t)>& progress) {
+                    const std::function<void(const std::string&, std::size_t, std::size_t)>& progress,
+                    const std::filesystem::path& cachePath) {
     Library lib;
+
+    if (!cachePath.empty()) {
+        LibCacheData cd;
+        if (loadLibCache(cachePath, roots, cd)) {
+            lib.pkgs = std::move(cd.pkgs);
+            lib.scope = std::move(cd.scope);
+            lib.keys = std::move(cd.keys);
+            lib.dirs = std::move(cd.dirs);
+            lib.fullIndex = cd.fullIndex;
+            if (!lib.pkgs.empty()) {
+                return lib;
+            }
+        }
+    }
+
     lib.pkgs = discoverPackages(roots);
     if (lib.pkgs.empty()) {
         return lib;
     }
     lib.fullIndex = withKeyset || withDirs;
-    // 索引范围扩到每个包的父目录：一个 mount 就是一个 VFS 实例，
-    // 闸门和目录段都要看整个实例，只看手上这一个包会漏掉跨包引用。
     std::vector<std::filesystem::path> scopeRoots;
     for (const auto& r : roots) {
         scopeRoots.push_back(isPackageDir(r) ? r.parent_path() : r);
@@ -58,20 +73,41 @@ Library openLibrary(const std::vector<std::filesystem::path>& roots, int threads
                           }
                       });
     }
+
+    if (!cachePath.empty()) {
+        LibCacheData cd;
+        cd.pkgs = lib.pkgs;
+        cd.scope = lib.scope;
+        cd.keys = lib.keys;
+        cd.dirs = lib.dirs;
+        cd.fullIndex = lib.fullIndex;
+        saveLibCache(cachePath, roots, cd);
+    }
+
     return lib;
 }
 
-std::shared_ptr<PackageEntry> openPackageEntry(Library& lib, const PackageRef& ref) {
+std::shared_ptr<PackageEntry> openPackageEntry(Library& lib, const PackageRef& ref,
+                                               const std::filesystem::path& cachePath) {
     const std::string key = pathKey(ref.dir);
     if (const auto hit = lib.opened.find(key); hit != lib.opened.end()) {
         return hit->second;
     }
+
     auto entry = std::make_shared<PackageEntry>();
     entry->pkg = std::make_shared<Package>();
     std::string err;
     if (!entry->pkg->open(ref.dir, err) || !entry->pkg->loadNodes(err)) {
         return nullptr;
     }
+
+    if (!cachePath.empty()) {
+        if (loadHarvestCache(cachePath, *entry->pkg, *entry)) {
+            lib.opened.emplace(key, entry);
+            return entry;
+        }
+    }
+
     entry->nodes.reserve(entry->pkg->nodes().size());
     for (const auto& [h, node] : entry->pkg->nodes()) {
         (void)h;
@@ -83,6 +119,11 @@ std::shared_ptr<PackageEntry> openPackageEntry(Library& lib, const PackageRef& r
               lib.dirs.empty() ? nullptr : &lib.dirs);
     buildTree(entry->nodes, entry->names, entry->root, entry->treeStats, &entry->sources);
     sortTree(entry->root);
+
+    if (!cachePath.empty()) {
+        saveHarvestCache(cachePath, *entry);
+    }
+
     lib.opened.emplace(key, entry);
     return entry;
 }

@@ -33,7 +33,8 @@ public:
     // 线程启动前由界面线程调用：QThread::start 提供 happens-before。
     enum Job { kImport = 1, kHarvest = 2, kExport = 3 };
     void setJob(std::vector<std::filesystem::path> roots, std::filesystem::path outDir,
-                qtsvfs::PackageRef target, Job kind, bool fullIndex);
+                qtsvfs::PackageRef target, Job kind, bool fullIndex,
+                std::filesystem::path cachePath = {});
 
 public slots:
     void run();
@@ -52,6 +53,7 @@ private:
     qtsvfs::PackageRef target_;
     Job kind_ = kImport;
     bool fullIndex_ = true;
+    std::filesystem::path cachePath_;
     std::atomic<bool> cancelled_{false};
 };
 
